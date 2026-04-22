@@ -248,58 +248,23 @@ export function getMarketStatus(): { open: boolean; nextOpen: string; currentTim
 // ======== IBKR HISTORICAL DATA FETCH (PRIMARY when connected) ========
 async function fetchIBKRIntradayStock(ticker: string): Promise<StockData | null> {
   const cached = stockCache.get(`ibkr_${ticker}`);
-  const fallbackMesLiveTick = (reason: string): StockData | null => {
-    if (ticker !== FUTURES_UNDERLYING) return null;
-    const liveMes = ibkr.getMesFuturePrice(IBKR_FUTURES_SYMBOL);
-    const last = liveMes?.last;
-    if (typeof last !== "number" || !Number.isFinite(last) || last <= 0) {
-      console.warn(`[FALLBACK_TICK_LIVE] MES unavailable | reason=${reason} | liveTick=no`);
-      return null;
-    }
-    const base = cached?.data;
-    const prevClose = typeof base?.prevClose === "number" && base.prevClose > 0 ? base.prevClose : last;
-    const change = r2(last - prevClose);
-    const changePct = prevClose > 0 ? r2((change / prevClose) * 100) : 0;
-    const result: StockData = {
-      ticker,
-      open: base?.open ?? prevClose,
-      high: Math.max(base?.high ?? last, last),
-      low: Math.min(base?.low ?? last, last),
-      close: last,
-      volume: base?.volume ?? 0,
-      vwap: base?.vwap ?? last,
-      prevClose,
-      change,
-      changePct,
-      source: "ibkr",
-      timestamp: liveMes?.timestamp || Date.now(),
-      delayed: false,
-      rsi14: base?.rsi14 ?? 50,
-      macdLine: base?.macdLine ?? 0,
-      macdSignal: base?.macdSignal ?? 0,
-      macdHist: base?.macdHist ?? 0,
-      ema9: base?.ema9 ?? last,
-      ema21: base?.ema21 ?? last,
-      adx: base?.adx ?? 0,
-      barsCount: base?.barsCount ?? 0,
-    };
-    stockCache.set(`ibkr_${ticker}`, { data: result, ts: Date.now() });
-    console.warn(`[FALLBACK_TICK_LIVE] MES historical unavailable | reason=${reason} | last=${last} | bid=${liveMes?.bid ?? "n/a"} | ask=${liveMes?.ask ?? "n/a"} | cached=${base ? "yes" : "no"}`);
-    return result;
-  };
   if (cached && Date.now() - cached.ts < STOCK_CACHE_TTL) return cached.data;
+
   try {
     // Request 5-min bars for 5 days from IBKR (enough for RSI-14, MACD-26, ADX-14)
     const historyTicker = ticker === FUTURES_UNDERLYING ? IBKR_FUTURES_SYMBOL : ticker;
     const bars = await ibkr.getHistoricalBars(historyTicker, "5 mins", "5 D", "TRADES");
+
     if (bars.length < 5) {
       console.warn(`[IBKR Hist] ${ticker}: only ${bars.length} bars, insufficient`);
-      return fallbackMesLiveTick(`insufficient_bars:${bars.length}`);
+      return null;
     }
+
     const closes = bars.map(b => b.close);
     const highs = bars.map(b => b.high);
     const lows = bars.map(b => b.low);
     const volumes = bars.map(b => b.volume);
+
     // Today's bars only (for VWAP)
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
@@ -309,26 +274,32 @@ async function fetchIBKRIntradayStock(ticker: string): Promise<StockData | null>
     const todayLows = todayBars.map(b => b.low);
     const todayCloses = todayBars.map(b => b.close);
     const todayVolumes = todayBars.map(b => b.volume);
+
     // Calculate ALL indicators from IBKR candles
     const rsi14 = calcRSI(closes, 14);
     const macd = calcMACD(closes);
     const ema9 = calcEMA(closes, 9);
     const ema21 = calcEMA(closes, 21);
     const adx = calcADX(highs, lows, closes, 14);
+
     // VWAP from today's bars only
     const vwap = todayCloses.length > 0
       ? calcVWAP(todayHighs, todayLows, todayCloses, todayVolumes)
       : closes[closes.length - 1];
+
     // Get real-time price from IBKR tick data
     const ibkrLive = ticker === FUTURES_UNDERLYING ? ibkr.getMesFuturePrice(IBKR_FUTURES_SYMBOL) : ibkr.getStockPrice(ticker);
     const currentPrice = ibkrLive?.last || closes[closes.length - 1];
     const prevClose = bars.length > 78 ? bars[bars.length - 78]?.close || closes[0] : closes[0]; // ~78 bars = 1 day of 5min
     const change = r2(currentPrice - prevClose);
     const changePct = prevClose > 0 ? r2((change / prevClose) * 100) : 0;
+
     // Today's total volume
     const todayVolume = ibkrLive?.volume || todayVolumes.reduce((a, b) => a + b, 0);
+
     // Latest bar for OHLC
     const lastBar = todayBars.length > 0 ? todayBars[todayBars.length - 1] : bars[bars.length - 1];
+
     const result: StockData = {
       ticker,
       open: todayBars.length > 0 ? todayBars[0].open : lastBar.open,
@@ -352,14 +323,16 @@ async function fetchIBKRIntradayStock(ticker: string): Promise<StockData | null>
       adx,
       barsCount: bars.length,
     };
+
     stockCache.set(`ibkr_${ticker}`, { data: result, ts: Date.now() });
     console.log(`[IBKR Hist] ${ticker}: $${currentPrice} | RSI:${rsi14} MACD:${macd.hist > 0 ? '+' : ''}${macd.hist} ADX:${adx} VWAP:$${vwap} | ${bars.length} IBKR bars`);
     return result;
   } catch (e: any) {
     console.error(`[IBKR Hist] Failed to fetch ${ticker}:`, e.message);
-    return fallbackMesLiveTick(`historical_error:${e?.message || "unknown"}`);
+    return null;
   }
 }
+
 // ======== YAHOO DISABLED IN TRADING PATH ========
 async function fetchIntradayStock(_ticker: string): Promise<StockData | null> {
   console.error("[DATA_BLOCK] Yahoo fallback disabled - returning null");
