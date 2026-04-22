@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: oklch(0.15 0.02 260);
+  --color-foreground: oklch(0.95 0.01 260);
+  --color-card: oklch(0.18 0.02 260);
+  --color-card-foreground: oklch(0.95 0.01 260);
+  --color-primary: oklch(0.65 0.2 145);
+  --color-primary-foreground: oklch(1 0 0);
+  --color-secondary: oklch(0.22 0.02 260);
+  --color-secondary-foreground: oklch(0.95 0.01 260);
+  --color-muted: oklch(0.22 0.02 260);
+  --color-muted-foreground: oklch(0.55 0.02 260);
+  --color-accent: oklch(0.25 0.02 260);
+  --color-accent-foreground: oklch(0.95 0.01 260);
+  --color-destructive: oklch(0.55 0.22 25);
+  --color-destructive-foreground: oklch(1 0 0);
+  --color-border: oklch(0.25 0.02 260);
+  --color-input: oklch(0.25 0.02 260);
+  --color-ring: oklch(0.65 0.2 145);
+  --radius: 0.5rem;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  body {
+    direction: rtl;
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: 'IBM Plex Sans Arabic', 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Ensure numbers stay LTR */
+.ltr-nums {
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--color-background); }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-muted-foreground); }

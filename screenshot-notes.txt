@@ -1,0 +1,9 @@
+Dashboard screenshot captured:
+- Dark theme working perfectly
+- Sidebar with: Dashboard, Open Trades, Trade History, Reports, Settings, Bot Logs
+- Shows: PAPER mode, Strategy: milking, Polygon.io connected, fallback data
+- Market: Open, SPY: $645.00, QQQ: $574.00, VIX: 18.0
+- Capital: $1,000, Today P&L: $0.00, Win Rate: 0%, Profit Factor: 0
+- Open Positions (0), Recent Activity: No activity
+- Start/Stopped button visible
+- The dev server restarted so the bot needs to be started again

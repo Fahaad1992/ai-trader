@@ -1,0 +1,88 @@
+import { useClosedTrades } from "../hooks/useTrading";
+import { History } from "lucide-react";
+import { useState, useMemo } from "react";
+
+const pnlColor = (v: number) => v > 0 ? "text-green-400" : v < 0 ? "text-red-400" : "text-muted-foreground";
+
+const strategyAr: Record<string, string> = { milking: "حلب سريع", hold: "احتفاظ", zeroHero: "زيرو هيرو" };
+const reasonAr: Record<string, string> = { "take-profit": "جني أرباح", "stop-loss": "وقف خسارة", "trailing-stop": "وقف متحرك", "manual": "يدوي", "expiry": "انتهاء", "risk-limit": "حد مخاطر" };
+
+export default function HistoryPage() {
+  const { data: all } = useClosedTrades();
+  const [fStrategy, setFS] = useState("all");
+  const [fType, setFT] = useState("all");
+
+  const filtered = useMemo(() => {
+    if (!all) return [];
+    return all.filter(t => {
+      if (fStrategy !== "all" && t.strategy !== fStrategy) return false;
+      if (fType !== "all" && t.contractType !== fType) return false;
+      return true;
+    });
+  }, [all, fStrategy, fType]);
+
+  return (
+    <div className="space-y-6 max-w-7xl">
+      <div>
+        <h1 className="text-2xl font-bold">سجل الصفقات</h1>
+        <p className="text-sm text-muted-foreground mt-1">{filtered.length} صفقة مغلقة</p>
+      </div>
+
+      <div className="flex items-center gap-3 flex-wrap">
+        <select value={fStrategy} onChange={e => setFS(e.target.value)} className="bg-secondary text-foreground border border-border rounded-lg px-3 py-1.5 text-sm">
+          <option value="all">كل الاستراتيجيات</option>
+          <option value="milking">حلب سريع</option>
+          <option value="hold">احتفاظ</option>
+          <option value="zeroHero">زيرو هيرو</option>
+        </select>
+        <select value={fType} onChange={e => setFT(e.target.value)} className="bg-secondary text-foreground border border-border rounded-lg px-3 py-1.5 text-sm">
+          <option value="all">كل الأنواع</option>
+          <option value="call">شراء</option>
+          <option value="put">بيع</option>
+        </select>
+      </div>
+
+      {!filtered.length ? (
+        <div className="bg-card border border-border rounded-xl py-16 text-center">
+          <History className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+          <p className="text-lg text-muted-foreground">لا يوجد سجل صفقات</p>
+        </div>
+      ) : (
+        <div className="bg-card border border-border rounded-xl overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-muted-foreground">
+                <th className="text-right py-3 px-4 font-medium">التاريخ</th>
+                <th className="text-right py-3 px-4 font-medium">السهم</th>
+                <th className="text-right py-3 px-4 font-medium">النوع</th>
+                <th className="text-right py-3 px-4 font-medium">الاستراتيجية</th>
+                <th className="text-left py-3 px-4 font-medium">الدخول</th>
+                <th className="text-left py-3 px-4 font-medium">الخروج</th>
+                <th className="text-left py-3 px-4 font-medium">الكمية</th>
+                <th className="text-left py-3 px-4 font-medium">الربح/الخسارة</th>
+                <th className="text-left py-3 px-4 font-medium">%</th>
+                <th className="text-right py-3 px-4 font-medium">السبب</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(t => (
+                <tr key={t.id} className="border-b border-border/50 hover:bg-secondary/30 transition-colors">
+                  <td className="py-3 px-4 text-muted-foreground ltr-nums">{t.closedAt ? new Date(t.closedAt).toLocaleDateString('ar-SA') : '-'}</td>
+                  <td className="py-3 px-4 font-medium">{t.underlying}</td>
+                  <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-xs ${t.contractType === 'call' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>{t.contractType === 'call' ? 'شراء' : 'بيع'}</span></td>
+                  <td className="py-3 px-4"><span className="px-1.5 py-0.5 rounded text-xs bg-secondary text-muted-foreground">{strategyAr[t.strategy] ?? t.strategy}</span></td>
+                  <td className="py-3 px-4 text-left ltr-nums">${t.entryPremium.toFixed(2)}</td>
+                  <td className="py-3 px-4 text-left ltr-nums">${t.currentPremium.toFixed(2)}</td>
+                  <td className="py-3 px-4 text-left ltr-nums">{t.quantity}</td>
+                  <td className={`py-3 px-4 text-left font-bold ltr-nums ${pnlColor(t.pnl)}`}>{t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}</td>
+                  <td className={`py-3 px-4 text-left ltr-nums ${pnlColor(t.pnlPercent)}`}>{t.pnlPercent >= 0 ? '+' : ''}{t.pnlPercent.toFixed(1)}%</td>
+                  <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-xs border ${t.closeReason === 'take-profit' ? 'text-green-400 border-green-400/30' : t.closeReason === 'stop-loss' ? 'text-red-400 border-red-400/30' : 'text-muted-foreground border-border'}`}>{reasonAr[t.closeReason ?? ''] ?? t.closeReason ?? 'يدوي'}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}

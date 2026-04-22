@@ -1,0 +1,18 @@
+services:
+  ib-gateway-live:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway-live
+    restart: always
+    environment:
+      TWS_USERID: Fahaad306
+      TWS_PASSWORD: Ff097531
+      TRADING_MODE: live
+      READ_ONLY_API: "no"
+      TWS_ACCEPT_INCOMING: accept
+      TWOFA_TIMEOUT_ACTION: restart
+      TIME_ZONE: Etc/UTC
+      VNC_SERVER_PASSWORD: 83e8092f36434a719938
+      SAVE_TWS_SETTINGS: "yes"
+    ports:
+      - "127.0.0.1:4001:4003"
+      - "0.0.0.0:6080:6080"

@@ -1,0 +1,28 @@
+Polygon.io Options Chain Snapshot API:
+GET /v3/snapshot/options/{underlyingAsset}
+
+Parameters:
+- underlyingAsset: ticker symbol (e.g., SPY, QQQ, AAPL)
+- strike_price: filter by strike
+- expiration_date: YYYY-MM-DD
+- contract_type: call or put
+- order: asc/desc
+- limit: max 250
+- sort: ticker
+
+Response includes per contract:
+- break_even_price
+- day: change, close, high, low, open, volume, vwap
+- details: contract_type, exercise_style, expiration_date, shares_per_contract, strike_price, ticker
+- greeks: delta, gamma, theta, vega
+- implied_volatility
+- last_quote: ask, ask_size, bid, bid_size, midpoint
+- last_trade: price, size
+- open_interest
+- underlying_asset: price, ticker
+
+For SPX index options: use I:SPX as underlying
+API URL: https://api.polygon.io/v3/snapshot/options/{underlyingAsset}?apiKey=KEY
+
+Free tier: 5 calls/min, 15-min delayed
+Paid: real-time

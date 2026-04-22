@@ -1,0 +1,98 @@
+import { useOpenTrades, useCloseTrade } from "../hooks/useTrading";
+import { Activity, X } from "lucide-react";
+import { toast } from "sonner";
+
+const pnlColor = (v: number) => v > 0 ? "text-green-400" : v < 0 ? "text-red-400" : "text-muted-foreground";
+
+const strategyAr: Record<string, string> = {
+  milking: "حلب سريع",
+  hold: "احتفاظ",
+  zeroHero: "زيرو هيرو",
+};
+
+export default function TradesPage() {
+  const { data: trades, refetch } = useOpenTrades();
+  const closeTrade = useCloseTrade();
+
+  const handleClose = async (id: string, cp: number) => {
+    await closeTrade(id, cp);
+    toast.success("تم إغلاق الصفقة");
+    refetch();
+  };
+
+  return (
+    <div className="space-y-6 max-w-7xl">
+      <div>
+        <h1 className="text-2xl font-bold">الصفقات المفتوحة</h1>
+        <p className="text-sm text-muted-foreground mt-1">{trades?.length ?? 0} صفقة نشطة</p>
+      </div>
+
+      {!trades?.length ? (
+        <div className="bg-card border border-border rounded-xl py-16 text-center">
+          <Activity className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+          <p className="text-lg text-muted-foreground">لا توجد صفقات مفتوحة</p>
+          <p className="text-sm text-muted-foreground mt-1">تظهر الصفقات هنا عندما يفتح البوت مراكز جديدة</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {trades.map(t => (
+            <div key={t.id} className="bg-card border border-border rounded-xl p-5">
+              <div className="flex items-start justify-between flex-wrap gap-4">
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {t.tradeMode !== "futures" && (
+                      <span className={`px-2 py-0.5 rounded text-sm font-medium ${t.contractType === 'call' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>{t.contractType === 'call' ? 'شراء' : 'بيع'}</span>
+                    )}
+                    <span className="text-lg font-bold">{t.underlying}</span>
+                    <span className="px-2 py-0.5 rounded text-xs bg-secondary text-muted-foreground">{strategyAr[t.strategy] ?? t.strategy}</span>
+                    <span className="px-2 py-0.5 rounded text-xs bg-secondary/50 text-muted-foreground">{t.mode === 'paper' ? 'ورقي' : 'حقيقي'}</span>
+                    {t.dataSource && (
+                      <span className="px-2 py-0.5 rounded text-xs bg-green-500/10 text-green-400">بيانات حقيقية</span>
+                    )}
+                  </div>
+                  {t.tradeMode !== "futures" && t.optionTicker && (
+                    <p className="text-xs text-muted-foreground font-mono ltr-nums">{t.optionTicker}</p>
+                  )}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+                    {t.tradeMode !== "futures" && <div><p className="text-muted-foreground text-xs">سعر التنفيذ</p><p className="font-medium ltr-nums">${t.strike}</p></div>}
+                    <div><p className="text-muted-foreground text-xs">سعر الدخول</p><p className="font-medium ltr-nums">${t.entryPremium.toFixed(2)}</p></div>
+                    <div><p className="text-muted-foreground text-xs">السعر الحالي</p><p className={`font-medium ltr-nums ${pnlColor(t.currentPremium - t.entryPremium)}`}>${t.currentPremium.toFixed(2)}</p></div>
+                    <div><p className="text-muted-foreground text-xs">الكمية</p><p className="font-medium ltr-nums">x{t.quantity}</p></div>
+                  </div>
+                  {t.tradeMode !== "futures" && (
+                    <>
+                      <div className="grid grid-cols-3 sm:grid-cols-6 gap-3 text-sm">
+                        <div><p className="text-muted-foreground text-xs">دلتا</p><p className="font-medium text-blue-400 ltr-nums">{t.delta?.toFixed(3) ?? '-'}</p></div>
+                        <div><p className="text-muted-foreground text-xs">جاما</p><p className="font-medium ltr-nums">{t.gamma?.toFixed(4) ?? '-'}</p></div>
+                        <div><p className="text-muted-foreground text-xs">ثيتا</p><p className="font-medium text-red-400 ltr-nums">{t.theta?.toFixed(2) ?? '-'}</p></div>
+                        <div><p className="text-muted-foreground text-xs">فيجا</p><p className="font-medium ltr-nums">{t.vega?.toFixed(2) ?? '-'}</p></div>
+                        <div><p className="text-muted-foreground text-xs">التقلب الضمني</p><p className="font-medium ltr-nums">{t.iv ? `${(t.iv * 100).toFixed(1)}%` : '-'}</p></div>
+                        <div><p className="text-muted-foreground text-xs">الانتهاء</p><p className="font-medium ltr-nums">{t.expiry}</p></div>
+                      </div>
+                      {(t.volume || t.openInterest) && (
+                        <div className="flex items-center gap-4 text-xs text-muted-foreground ltr-nums">
+                          {t.volume ? <span>الحجم: <span className="text-foreground font-medium">{t.volume.toLocaleString()}</span></span> : null}
+                          {t.openInterest ? <span>العقود المفتوحة: <span className="text-foreground font-medium">{t.openInterest.toLocaleString()}</span></span> : null}
+                          <span>وقت الفتح: {new Date(t.openedAt).toLocaleTimeString('ar-SA')}</span>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+                <div className="text-left space-y-3">
+                  <div>
+                    <p className={`text-2xl font-bold ltr-nums ${pnlColor(t.pnl)}`}>{t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}</p>
+                    <p className={`text-sm ltr-nums ${pnlColor(t.pnlPercent)}`}>{t.pnlPercent >= 0 ? '+' : ''}{t.pnlPercent.toFixed(1)}%</p>
+                  </div>
+                  <button onClick={() => handleClose(t.id, t.currentPremium)} className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm">
+                    <X className="h-3 w-3" /> إغلاق
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
