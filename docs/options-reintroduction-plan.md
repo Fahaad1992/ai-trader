@@ -112,21 +112,79 @@
 
 الموصى به أيضًا هو أن يتم تمثيل الأوبشن داخليًا عبر كيان domain مستقل مثل `OptionContract`, `OptionQuote`, `OptionSelectionRequest`, `OptionExecutionIntent`، بدل الاعتماد على نشر حقول الأوبشن داخل `Trade` العام. وإذا بقي `Trade` مشتركًا، فيجب أن يكون union type واضحًا مثل `FuturesTrade | OptionsTrade` بدل الشكل المرن الحالي الذي يسمح باختلاط الصفات [8] [9].
 
+## What stays for futures runtime
+
+بعد إزالة مسارات الأوبشن، يجب أن يبقى في runtime فقط ما يخدم **التداول الحي على العقود المستقبلية عبر IBKR**. الأدلة الحالية تظهر أن النسخة العاملة في `TRADE_MODE=futures` تعتمد على اشتراك `/MESM6` و`VIX`، وتعرض حالة اتصال ناجحة مع `requestedMarketDataType:"LIVE"` و`marketDataMode:"live"` عندما تكون طبقة IBKR سليمة، حتى لو بقيت بعض مسارات الأوبشن dormant داخل الشفرة [2] [3] [4] [9] [17] [18].
+
+| Component | Why it stays in futures runtime | Constraint after cleanup |
+|---|---|---|
+| `server/trading/ibkr-client.ts` | هو قلب الاتصال بـ IBKR، ويبني عقد MES، ويشترك في بيانات السوق، ويجلب historical bars، ويصدر أوامر التنفيذ [4] [18] [19] | يبقى **futures-only**؛ أي helpers خاصة بالأوبشن تُزال أو تُفصل لاحقًا |
+| `server/trading/market-data.ts` | ما زال مسؤولًا عن تحميل البيانات الدنيا المطلوبة لمسار futures وعن حظر التداول عند غياب بيانات IBKR اللازمة [2] [17] [18] | يحتفظ فقط بمسار MES/VIX وبيانات IBKR الحية/التاريخية |
+| `server/trading/engine.ts` | يبقى orchestrator الرئيسي للتشغيل، الصحة، التقييم، التنفيذ، وإخراج الحالة العامة للبوت [3] [17] | يمنع أي استدعاء option selection أو option execution |
+| `server/trading/mes-futures-resolver.ts` | يخدم دقة التعامل مع عقد MES الجاري ويُعد جزءًا تخصصيًا من futures path [13] | يبقى دون خلط مع أي naming أو provider legacy |
+| `server/trading/database.ts` | التخزين المحلي للصفقات والسجلات والإحصاءات ما زال مطلوبًا لمسار futures [7] | تُحتمل الأعمدة legacy مؤقتًا، لكن لا تُستخدم لإعادة منطق options ضمن runtime |
+| `server/trading/trade-mode.ts` | يوفر guard مفيدًا خلال مرحلة الانتقال، ويمنع تسرب بعض حقول الأوبشن إلى مخرجات futures [9] | يبقى مؤقتًا إلى أن يكتمل الفصل البنيوي الكامل |
+| `server/trading/news-filter.ts` و`server/trading/notify.ts` | لا توجد أدلة على أنهما مرتبطان جوهريًا بمسار الأوبشن، وهما يخدمان filters والإشعارات العامة للبوت [13] | يستمران دون أي اعتماد على أنواع أو مزوّدات options |
+| `server/index.ts` | يبقى shell الخاص بالـ API والـ bot lifecycle [1] [13] | تبقى فقط endpointات futures والعمليات العامة، مع حذف endpointات options لاحقًا |
+
+المعيار هنا ليس "ما يمكن أن يظل موجودًا نظريًا"، بل **ما لا يستطيع futures runtime العمل بدونه**. لذلك فإن أي ملف يظل بعد التنظيف يجب أن تكون له وظيفة مباشرة في: **IBKR live connectivity** أو **MES/VIX market state** أو **risk orchestration** أو **persistence** أو **notifications**، وما عدا ذلك ينبغي إعادة هيكلته أو إخراجه من المسار التشغيلي [2] [3] [4] [7] [9] [17].
+
+## File-by-file decision table
+
+الجدول التالي هو **جدول قرار تنفيذي** يحدد الإجراء المستقبلي المقترح لكل ملف ذي صلة بمرحلة التحويل إلى futures-only. المقصود هنا هو قرار التخطيط، لا تنفيذ الحذف الآن؛ إذ إن القيود الحالية ما زالت تمنع أي حذف أو rebuild قبل الاعتماد اللاحق [1] [2] [3] [4] [5] [6] [7] [8] [9] [13] [15].
+
+| File | Decision | Rationale | Futures runtime consequence |
+|---|---|---|---|
+| `server/trading/market-data.ts` | **REFACTOR** | يحتوي مسار futures المطلوب، لكنه يضم كذلك `OptionQuote`, `fetchOptionsChain`, `findOption`, `getOptionPrice`, وrate limiter لـ Polygon [2] [13] | يبقى ملفًا مركزيًا بعد تنظيف كل فروع الأوبشن |
+| `server/trading/engine.ts` | **REFACTOR** | هو محرك التشغيل الرئيسي، لكنه ما زال يستورد tastytrade snapshot ويحمل فروع execution مرتبطة بالأوبشن [3] [13] | يجب أن يبقى، لكن بعد نزع option execution بالكامل |
+| `server/trading/ibkr-client.ts` | **REFACTOR** | مطلوب لمسار الاتصال والتنفيذ والعقود المستقبلية، لكنه ما زال يحتوي helpers لـ option chain/snapshot [4] [13] | يبقى core client الخاص بـ IBKR futures/live |
+| `server/index.ts` | **REFACTOR** | يحتوي endpoint عامّة لازمة، وبالمقابل يضم `/api/ibkr/spy-chain` الخاص بالأوبشن [1] [13] | يبقى كواجهة API للبوت بعد إزالة endpoint الأوبشن |
+| `shared/types.ts` | **REFACTOR** | النماذج الحالية هجينة بين futures وoptions، ما يسبب اختلاطًا على مستوى النوع والمخرجات [8] [13] | يجب أن تنتهي إلى futures-only أو union types واضحة لاحقًا |
+| `server/trading/trade-mode.ts` | **KEEP** | لا ينشئ الفصل البنيوي المطلوب، لكنه guard انتقالي مهم لمسار futures الحالي [9] | يبقى مؤقتًا لحين اكتمال التنظيف البنيوي |
+| `server/trading/database.ts` | **KEEP** | التخزين الحالي ما زال يخدم trades/logs/stats المطلوبة للبوت [7] [13] | لا حاجة لتغييره قبل تنظيف runtime نفسه |
+| `server/trading/mes-futures-resolver.ts` | **KEEP** | ملف متخصص في futures path ولا توجد أدلة على أنه جزء من options runtime [13] | يجب الاحتفاظ به كما هو |
+| `server/trading/news-filter.ts` | **KEEP** | يخدم منطق الفلترة الإخبارية العامة، لا مسار options بحد ذاته [13] | يستمر مع futures runtime |
+| `server/trading/notify.ts` | **KEEP** | إشعارات عامة وليست جزءًا خاصًا بالأوبشن [13] | يستمر كما هو |
+| `server/trading/tastytrade-account.ts` | **DELETE** | تكامل مزوّد قديم لا يخدم هدف IBKR futures-only، وما زال ظاهرًا فقط كتركة تشغيلية [5] [13] | يجب ألا يبقى ضمن runtime النهائي |
+| `server/trading/mes-market-feed.ts` | **DELETE** | مصدر `tastytrade-dxfeed` legacy ولا يتوافق مع مسار IBKR-only المعتمد [6] [13] | ينبغي إخراجه نهائيًا من مسار التشغيل |
+| `server/trading/decision-engine.ts` | **REFACTOR** | الجرد الحالي يُظهر اعتمادًا على `OptionQuote`، ما يعني أن الملف ليس futures-pure بعد [13] | يمكن إبقاؤه فقط إذا أزيل الاعتماد على types الخاصة بالأوبشن |
+| `.env` | **KEEP** | المستخدم حظر تعديله في هذه المرحلة، كما أنه ليس جزءًا من حذف مسارات الأوبشن الآن [11] | يبقى ثابتًا دون تعديل |
+| `package.json` | **KEEP** | لا توجد حزم npm خاصة بـ Polygon/tastytrade تستلزم حذفًا عاجلًا؛ التكامل الحالي يتم بالشفرة وenv vars [10] [13] | لا حاجة لتغييره قبل مرحلة الكود |
+| `docs/options-reintroduction-plan.md` | **KEEP** | هذا هو المرجع المعتمد قبل أي حذف | يجب أن يبقى كوثيقة الضبط المرجعي الحالية |
+| `server/trading/*.bak*` و`server/trading/backup_*` | **ARCHIVE** | ملفات مرجعية متراكمة وعددها كبير، لكنها ليست runtime production files [13] | لا تُحذف الآن؛ تبقى مرجعًا مؤرشفًا خارج نطاق التنفيذ |
+
+> معنى القرارات هنا دقيق: **KEEP** يعني أن الملف يجب أن يظل في runtime النهائي للفيوتشرز؛ **REFACTOR** يعني أن الملف يبقى لكن بعد تنظيف داخله؛ **DELETE** يعني أنه لا ينبغي أن يبقى في runtime النهائي؛ و**ARCHIVE** يعني أنه لا يدخل في runtime أصلًا لكنه يُحتفَظ به مؤقتًا كمرجع حتى إغلاق مرحلة التحويل [13] [15].
+
+## Live-only runtime data rules
+
+لكي يكون مسار futures فعلاً **live-only**، لا يكفي أن تكون جلسة IBKR متصلة أو أن تكون قيمة `requestedMarketDataType` قد ضُبطت مرة واحدة على `LIVE`. الأدلة الحالية تُظهر أن البوت قد يكون `ibkrConnected=true` بينما تبقى `dataFresh=false` و`stocks={}`، ما يؤكد أن **الاتصال وحده ليس معيار صلاحية للتداول** [17]. كما أن فحوص المكتبة تشير بوضوح إلى مجموعة tick types المتأخرة `66, 67, 68, 72, 73, 75, 76` التي تُعامل كبيانات delayed، مقابل live tick types منفصلة [16].
+
+| Rule | Detection condition | Required behavior |
+|---|---|---|
+| **`marketDataType=3` forbidden** | إذا كانت حالة الطلب أو الحالة الداخلية تشير إلى delayed market data بدل `LIVE (1)`، أو إذا لم تعد `requestedMarketDataType` مساوية لـ `LIVE` [17] | **HARD BLOCK** فوري: لا scan، لا signal evaluation، لا entry orders، ولا fallback إلى delayed mode |
+| **`delayedTickTypes` forbidden** | إذا استقبلت المنظومة أي tick type من المجموعة `66, 67, 68, 72, 73, 75, 76` المصنفة delayed في فحص المكتبة [16] | **HARD BLOCK** فوري، مع وسم الحالة `marketDataMode=delayed` ورفض استخدام هذه القيم في pricing أو indicators |
+| **`stale > 2s` forbidden** | إذا تجاوز الفرق بين `Date.now()` و`dataTimestamp` آخر بيانات مطلوبة لـ MES/VIX أكثر من `2000ms`، أو إذا بقيت `dataFresh=false` أثناء وقت السوق المفتوح [17] | **HARD BLOCK** فوري حتى تعود بيانات live fresh؛ ويُمنع أي قرار تداول جديد أو إعادة تسعير تعتمد على feed قديم |
+
+المقصود بعبارة **HARD BLOCK** هنا هو سلوك صارم لا لبس فيه: **لا دخول صفقات جديدة، لا تقييم إشارات جديدة، لا fallback إلى Polygon أو delayed data، ولا استخدام أسعار قديمة في اتخاذ قرار runtime**. يمكن أن تبقى أوامر الحماية المرسلة مسبقًا إلى الوسيط فعّالة من جهة الوسيط نفسه، لكن البوت لا يملك حق اتخاذ قرار جديد اعتمادًا على تغذية متأخرة أو stale [2] [16] [17].
+
+ولكي تبقى هذه القاعدة قابلة للتدقيق لاحقًا، يجب أن تسجّل المنظومة سبب الحظر بصياغة صريحة، مثل `ibkr_delayed_data_forbidden` أو `ibkr_data_stale_gt_2s`، بدل الاكتفاء بعبارات عامة من نوع `waiting`. وهذا مهم خصوصًا لأن السجلات الحالية أظهرت حالات اتصال ناجح مع `marketDataMode:"live"` يقابلها في الوقت نفسه فشل في اكتمال طبقة البيانات الدنيا لـ `MES` و`VIX` [17] [18] [19] [20].
+
 ## 7. References (Git commits)
 
-هذا القسم **لا يمكن ملؤه بقيم commit حقيقية من Server 1 نفسه** لأن النسخة المنشورة في `/opt/ai-trader` **لا تحتوي على مجلد `.git` أصلًا**، وبالتالي لا يمكن استخراج `HEAD` أو تاريخ commits أو tags من بيئة النشر الحالية [12]. لذلك تُسجل القيم التالية كـ **حقول واجبة التعبئة من المستودع الأصلي** قبل تنفيذ الحذف النهائي:
+تمت معالجة غياب Git metadata في نسخة `Server 1` المنشورة عبر **تهيئة مستودع Git محلي جديد داخل `/opt/ai-trader`** ثم أخذ **snapshot baseline** قبل أي حذف لمسارات الأوبشن. هذا لا يعيد التاريخ الأصلي للمستودع المصدر، لكنه يوفر **نقطة رجوع محلية قابلة للاستخدام** ووسمًا واضحًا قبل بدء أعمال التنظيف [12] [15].
 
-| Reference | Current value from Server 1 deployment copy |
+| Reference | Current value on Server 1 local snapshot |
 |---|---|
-| Last commit with options runtime | `UNKNOWN_FROM_SERVER1_NO_GIT_METADATA` |
-| Commit that removed options | `NOT_CREATED_YET_IN_DEPLOYED_COPY` |
-| Tag | `pre-options-removal-20260422` **(planned tag; must be created in the source repository, not on Server 1 deployment copy)** |
+| Baseline pre-removal commit | `c3d4fa36568363d0d1c10d7ab74f425d1306ae21` |
+| Short hash | `c3d4fa3` |
+| Tag | `pre-options-removal-20260422` |
+| Provenance note | **Local bootstrap snapshot created on Server 1 after `git init`; not original source history** |
 
-> الإجراء الصحيح قبل أول commit حذف فعلي هو: العودة إلى المستودع الأصلي، أخذ آخر commit ما قبل الإزالة، إنشاء tag باسم `pre-options-removal-20260422`، ثم تسجيل hash فعلي في هذا القسم. نسخة Server 1 الحالية تكفي لتوثيق البنية، لكنها لا تكفي وحدها لتوثيق التاريخ Git [12].
+> هذه القيمة تمثل **أول snapshot محلي** في بيئة النشر بعد إنشاء `.git` يدويًا، وبالتالي فهي صالحة للـ rollback المحلي ولإنشاء branchات تجريبية قبل الحذف، لكنها **لا تمثل آخر commit تاريخي من المستودع الأصلي** الذي نُشرت منه النسخة الحالية [12] [15].
 
 ## Practical restoration checklist
 
-إذا قرر فريق العمل إعادة الأوبشن مستقبلًا، فيجب أن يبدأ من هذه القائمة المختصرة بدل الارتجال:
+إذا قرر فريق العمل إعادة الأوبشن مستقبلًا، فيجب أن يبدأ من هذه القائمة المختصرة بدل الارتجال. كما يجب التمييز منذ البداية بين **المرجع التاريخي الأصلي** وبين **snapshot Server 1 المحلي** ذي الهاش `c3d4fa36568363d0d1c10d7ab74f425d1306ae21` [15].
 
 | Step | Action |
 |---|---|
@@ -154,3 +212,9 @@
 [12]: file:///home/ubuntu/server1_git_repo_status_check.txt "Server 1 deployed copy Git status check"
 [13]: file:///home/ubuntu/server1_inventory_audit_raw.txt "Server 1 inventory audit raw"
 [14]: file:///home/ubuntu/server1_options_reference_evidence_raw.txt "Server 1 options reference evidence raw"
+[15]: file:///home/ubuntu/server1_git_bootstrap_full_raw.txt "Server 1 local Git bootstrap raw output"
+[16]: file:///home/ubuntu/server1_ib_library_probe_raw.txt "IB library delayed and live tick type probe"
+[17]: file:///home/ubuntu/server1_engine_start_probe_raw.txt "Server 1 engine start and status probe"
+[18]: file:///home/ubuntu/server1_data_layer_probe_stage2_raw.txt "Server 1 data layer probe stage 2"
+[19]: file:///home/ubuntu/server1_minimal_hist_tests_raw_local.txt "Server 1 minimal historical tests"
+[20]: file:///home/ubuntu/ibkr_market_data_subscription_notes_20260422.txt "IBKR market data subscription notes"
