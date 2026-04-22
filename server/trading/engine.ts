@@ -629,7 +629,7 @@ export class TradingEngine {
     if (typeof vix === "number" && vix > 25) return `VIX_LIMIT:${vix.toFixed(2)}`;
     const dailyPnl = this.getDailyPnl();
     const maxLoss = this.getDailyLossLimitAmount();
-    if (dailyPnl <= -maxLoss) return `DAILY_LOSS_LIMIT:${dailyPnl.toFixed(2)}`;
+    if (maxLoss > 0 && dailyPnl <= -maxLoss) return `DAILY_LOSS_LIMIT:${dailyPnl.toFixed(2)}`;
     return null;
   }
 
