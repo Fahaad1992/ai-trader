@@ -59,12 +59,33 @@ CREATE TABLE IF NOT EXISTS daily_stats (
   capital REAL
 );
 `);
+db.exec(`
+CREATE TABLE IF NOT EXISTS tv_webhook_events (
+  alert_id TEXT PRIMARY KEY,
+  received_at INTEGER NOT NULL,
+  processed_at INTEGER,
+  strategy_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  action TEXT NOT NULL,
+  alert_price REAL NOT NULL,
+  alert_timestamp TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  brain_decision TEXT,
+  brain_reason TEXT,
+  brain_response_json TEXT,
+  final_result TEXT NOT NULL,
+  last_error TEXT
+);
+`);
 
 db.exec(`
 CREATE INDEX IF NOT EXISTS idx_trades_opened_at ON trades(opened_at);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_tv_webhook_received_at ON tv_webhook_events(received_at);
+CREATE INDEX IF NOT EXISTS idx_tv_webhook_status ON tv_webhook_events(status);
 `);
 
 // ===== Prepared Statements =====
@@ -131,6 +152,31 @@ const upsertDailyStats = db.prepare(`
 
 const getDailyStats = db.prepare(`
   SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?
+`);
+const insertTradingViewWebhookEvent = db.prepare(`
+  INSERT OR IGNORE INTO tv_webhook_events (
+    alert_id, received_at, processed_at, strategy_id, symbol, action, alert_price,
+    alert_timestamp, payload_json, status, brain_decision, brain_reason,
+    brain_response_json, final_result, last_error
+  ) VALUES (
+    @alert_id, @received_at, @processed_at, @strategy_id, @symbol, @action, @alert_price,
+    @alert_timestamp, @payload_json, @status, @brain_decision, @brain_reason,
+    @brain_response_json, @final_result, @last_error
+  )
+`);
+const getTradingViewWebhookEventByAlertId = db.prepare(`
+  SELECT * FROM tv_webhook_events WHERE alert_id = ?
+`);
+const updateTradingViewWebhookEventOutcome = db.prepare(`
+  UPDATE tv_webhook_events SET
+    processed_at = @processed_at,
+    status = @status,
+    brain_decision = @brain_decision,
+    brain_reason = @brain_reason,
+    brain_response_json = @brain_response_json,
+    final_result = @final_result,
+    last_error = @last_error
+  WHERE alert_id = @alert_id
 `);
 
 // ===== Query Helpers =====
@@ -303,4 +349,51 @@ export function getTradesCountByStatus(status: string) {
   return row.count;
 }
 
+export function createTradingViewWebhookEvent(event: {
+  alert_id: string;
+  received_at: number;
+  processed_at?: number | null;
+  strategy_id: string;
+  symbol: string;
+  action: string;
+  alert_price: number;
+  alert_timestamp: string;
+  payload_json: string;
+  status: string;
+  brain_decision?: string | null;
+  brain_reason?: string | null;
+  brain_response_json?: string | null;
+  final_result: string;
+  last_error?: string | null;
+}) {
+  return insertTradingViewWebhookEvent.run({
+    ...event,
+    processed_at: event.processed_at ?? null,
+    brain_decision: event.brain_decision ?? null,
+    brain_reason: event.brain_reason ?? null,
+    brain_response_json: event.brain_response_json ?? null,
+    last_error: event.last_error ?? null,
+  });
+}
+export function loadTradingViewWebhookEvent(alertId: string) {
+  return getTradingViewWebhookEventByAlertId.get(alertId);
+}
+export function finalizeTradingViewWebhookEvent(update: {
+  alert_id: string;
+  processed_at: number;
+  status: string;
+  brain_decision?: string | null;
+  brain_reason?: string | null;
+  brain_response_json?: string | null;
+  final_result: string;
+  last_error?: string | null;
+}) {
+  return updateTradingViewWebhookEventOutcome.run({
+    ...update,
+    brain_decision: update.brain_decision ?? null,
+    brain_reason: update.brain_reason ?? null,
+    brain_response_json: update.brain_response_json ?? null,
+    last_error: update.last_error ?? null,
+  });
+}
 export default db;

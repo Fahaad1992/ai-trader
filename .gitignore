@@ -4,3 +4,14 @@ data/*.db
 *.log
 *.bak*
 .env
+.env*
+_tmp_*
+phase2_db_rows.js
+LIVE_GO_NOGO.sh
+quarantine_*
+tmp_*
+data/*.db-shm
+data/*.db-wal
+data/*.db.bak*
+.env.*
+*.bak

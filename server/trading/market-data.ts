@@ -426,6 +426,11 @@ export class MarketDataProvider {
   private ibkrMode = false;
 
   async connectIBKR(): Promise<boolean> {
+    if (this.ibkrMode && ibkr.isConnected()) {
+      console.log("[Market] IBKR already connected. Skipping duplicate init/subscribe.");
+      return true;
+    }
+
     console.log("[Market] Attempting IBKR connection...");
     const connected = await ibkr.connect();
     if (connected) {
@@ -704,7 +709,8 @@ export class MarketDataProvider {
   }
 
   async refreshPrices(): Promise<void> {
-    for (const t of ["SPY", "QQQ"]) {
+    const tickers = isFuturesMode() ? [FUTURES_UNDERLYING, "VIX"] : ["SPY", "QQQ"];
+    for (const t of tickers) {
       stockCache.delete(`ibkr_${t}`);
       stockCache.delete(t);
       const data = this.ibkrMode && ibkr.isConnected()

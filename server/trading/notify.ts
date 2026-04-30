@@ -111,10 +111,19 @@ function formatMode(mode: string): string {
 }
 
 function formatOptionType(type: string): string {
-  const value = type.toUpperCase();
+  const value = String(type || "").toUpperCase();
+  // ===== FUTURES LABELS =====
+  // For MES futures (DRY_RUN bidirectional), use LONG/SHORT instead of CALL/PUT.
+  if (value === "LONG") return "شراء (LONG)";
+  if (value === "SHORT") return "بيع (SHORT)";
   if (value === "CALL") return "كول";
   if (value === "PUT") return "بوت";
   return type;
+}
+
+function isFuturesSide(type: string): boolean {
+  const v = String(type || "").toUpperCase();
+  return v === "LONG" || v === "SHORT";
 }
 
 function formatCurrency(value?: number | null): string {
@@ -304,7 +313,10 @@ export function notifyTradeEntry(
     reasonArabic?: string | null;
   },
 ): void {
-  const contract = `${symbol} ${expiry} ${strike} ${formatOptionType(type)}`;
+  // Futures-aware contract label: for MES LONG/SHORT show symbol+side only (no strike/expiry).
+  const contract = isFuturesSide(type)
+    ? `${symbol} ${formatOptionType(type)}`
+    : `${symbol} ${expiry} ${strike} ${formatOptionType(type)}`;
   const finalContracts = context?.finalSize ?? contracts;
   const reasonArabic = context?.reasonArabic?.trim()
     || ((context?.requestedSize != null && finalContracts < context.requestedSize)

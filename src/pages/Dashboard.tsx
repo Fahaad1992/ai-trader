@@ -108,16 +108,137 @@ function TradeDetail({ trade }: { trade: Trade | null }) {
   );
 }
 
+type ActivityCategory =
+  | "ALL"
+  | "WAIT"
+  | "REJECT"
+  | "EXECUTE"
+  | "DRY_RUN"
+  | "IBKR"
+  | "ERROR"
+  | "TELEGRAM"
+  | "SMART_BRAIN";
+
+function classifyLog(log: BotLog): ActivityCategory[] {
+  const cats: ActivityCategory[] = [];
+  const msg = (log.message || "").toUpperCase();
+  const dec = (log.decision || "").toUpperCase();
+  const level = (log as any).level ? String((log as any).level).toUpperCase() : "";
+  if (dec === "WAIT" || msg.includes("WAIT")) cats.push("WAIT");
+  if (dec === "REJECT" || msg.includes("REJECT")) cats.push("REJECT");
+  if (dec === "EXECUTE" || msg.includes("EXECUTE") || msg.includes("TRADE_OPEN")) cats.push("EXECUTE");
+  if (msg.includes("DRY_RUN") || msg.includes("[DRY")) cats.push("DRY_RUN");
+  if (msg.includes("IBKR")) cats.push("IBKR");
+  if (level === "ERROR" || msg.includes("ERROR") || msg.includes("FAILED")) cats.push("ERROR");
+  if (msg.includes("TELEGRAM") || msg.includes("NOTIFY")) cats.push("TELEGRAM");
+  if (msg.includes("SMART") || msg.includes("BRAIN")) cats.push("SMART_BRAIN");
+  return cats;
+}
+
+function categoryColor(cat: ActivityCategory): string {
+  switch (cat) {
+    case "WAIT":        return "border-amber-500/40 bg-amber-500/5";
+    case "REJECT":      return "border-red-500/40 bg-red-500/5";
+    case "EXECUTE":     return "border-green-500/40 bg-green-500/5";
+    case "DRY_RUN":     return "border-blue-500/40 bg-blue-500/5";
+    case "IBKR":        return "border-cyan-500/40 bg-cyan-500/5";
+    case "ERROR":       return "border-red-600/50 bg-red-600/10";
+    case "TELEGRAM":    return "border-purple-500/40 bg-purple-500/5";
+    case "SMART_BRAIN": return "border-indigo-500/40 bg-indigo-500/5";
+    default:            return "border-border/60 bg-secondary/10";
+  }
+}
+
+function categoryBadge(cat: ActivityCategory): string {
+  switch (cat) {
+    case "WAIT":        return "bg-amber-500/20 text-amber-400";
+    case "REJECT":      return "bg-red-500/20 text-red-400";
+    case "EXECUTE":     return "bg-green-500/20 text-green-400";
+    case "DRY_RUN":     return "bg-blue-500/20 text-blue-400";
+    case "IBKR":        return "bg-cyan-500/20 text-cyan-400";
+    case "ERROR":       return "bg-red-600/20 text-red-400";
+    case "TELEGRAM":    return "bg-purple-500/20 text-purple-400";
+    case "SMART_BRAIN": return "bg-indigo-500/20 text-indigo-400";
+    default:            return "bg-secondary text-muted-foreground";
+  }
+}
+
 function RecentLogRow({ log }: { log: BotLog }) {
+  const cats = classifyLog(log);
+  const primary = cats[0] ?? ("ALL" as ActivityCategory);
+  const borderCls = categoryColor(primary);
   return (
-    <div className="rounded-xl border border-border/60 p-3 bg-secondary/10">
-      <p className="text-sm whitespace-pre-wrap break-words">{log.message}</p>
-      <div className="flex items-center gap-3 flex-wrap text-xs text-muted-foreground mt-2 ltr-nums">
+    <div className={`rounded-xl border p-3 ${borderCls}`}>
+      <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{log.message}</p>
+      <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground mt-2 ltr-nums">
         <span>{new Date(log.createdAt).toLocaleString("ar-SA")}</span>
-        {log.symbol && <span>{log.symbol}</span>}
-        {log.decision && <span>{log.decision}</span>}
-        {log.confidence !== null && log.confidence !== undefined && <span>Conf: {log.confidence}</span>}
+        {log.symbol && <span className="px-1.5 py-0.5 rounded bg-secondary">{log.symbol}</span>}
+        {log.decision && (
+          <span className={`px-1.5 py-0.5 rounded font-medium ${categoryBadge(log.decision as ActivityCategory)}`}>
+            {log.decision}
+          </span>
+        )}
+        {log.confidence !== null && log.confidence !== undefined && (
+          <span className="px-1.5 py-0.5 rounded bg-secondary">Conf: {log.confidence}</span>
+        )}
+        {cats.slice(0, 2).map((c) => (
+          <span key={c} className={`px-1.5 py-0.5 rounded text-[10px] ${categoryBadge(c)}`}>
+            {c}
+          </span>
+        ))}
       </div>
+    </div>
+  );
+}
+
+const ACTIVITY_FILTERS: ActivityCategory[] = [
+  "ALL",
+  "WAIT",
+  "REJECT",
+  "EXECUTE",
+  "DRY_RUN",
+  "IBKR",
+  "ERROR",
+  "TELEGRAM",
+  "SMART_BRAIN",
+];
+
+function ActivityFeed({ logs }: { logs: BotLog[] }) {
+  const [filter, setFilter] = useState<ActivityCategory>("ALL");
+  const filtered = useMemo(() => {
+    if (filter === "ALL") return logs;
+    return logs.filter((l) => classifyLog(l).includes(filter));
+  }, [logs, filter]);
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-1.5 text-xs">
+        {ACTIVITY_FILTERS.map((c) => (
+          <button
+            key={c}
+            onClick={() => setFilter(c)}
+            className={`px-2.5 py-1 rounded-lg border transition-colors ${
+              filter === c
+                ? "bg-primary text-primary-foreground border-primary"
+                : `border-border/60 hover:bg-accent ${c === "ALL" ? "" : categoryBadge(c)}`
+            }`}
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+      <div
+        className="max-h-[360px] md:max-h-[480px] overflow-y-auto overflow-x-hidden pr-1 space-y-2 rounded-xl border border-border/40 bg-background/40 p-2"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
+        {!filtered.length ? (
+          <p className="text-sm text-muted-foreground text-center py-6">لا يوجد نشاط مطابق.</p>
+        ) : (
+          filtered.map((log) => <RecentLogRow key={log.id} log={log} />)
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground text-center">
+        يعرض آخر {logs.length} نشاط — مُرشّح: {filter} — مرّر للأعلى والأسفل داخل السجل.
+      </p>
     </div>
   );
 }
@@ -160,14 +281,14 @@ export default function Dashboard() {
   const { data: daily } = useDailyStats();
   const { data: open } = useOpenTrades();
   const { data: smartBrain, refetch: refetchSmart } = useSmartBrainStats();
-  const { data: logs, refetch: refetchLogs } = useBotLogs({ limit: 10 });
+  const { data: logs, refetch: refetchLogs } = useBotLogs({ limit: 50 });
   const { start, stop } = useBotControl();
   const [statsWindow, setStatsWindow] = useState<WindowKey>("24h");
 
   const openPnl = open?.reduce((sum, trade) => sum + trade.pnl, 0) ?? 0;
   const closedPnl = daily?.dailyPnl ?? 0;
   const firstTrade = open?.[0] ?? null;
-  const recentLogs = useMemo(() => (logs ?? []).slice(0, 3), [logs]);
+  const recentLogs = useMemo(() => (logs ?? []), [logs]);
   const activeWindow = statsWindow === "24h" ? smartBrain?.last24h : smartBrain?.last48h;
   const brokerAccount = status?.brokerAccount ?? null;
   const realBalance = brokerAccount?.netLiquidatingValue ?? null;
@@ -292,14 +413,8 @@ export default function Dashboard() {
         </div>
       </SectionCard>
 
-      <SectionCard title="آخر 3 أنشطة" icon={Clock}>
-        {!recentLogs.length ? (
-          <p className="text-sm text-muted-foreground text-center py-6">لا يوجد نشاط حديث.</p>
-        ) : (
-          <div className="space-y-3">
-            {recentLogs.map((log) => <RecentLogRow key={log.id} log={log} />)}
-          </div>
-        )}
+      <SectionCard title="سجل الأنشطة" icon={Clock}>
+        <ActivityFeed logs={recentLogs} />
       </SectionCard>
 
       <SectionCard

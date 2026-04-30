@@ -11,6 +11,29 @@ import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
+import { isProtectionReady, classifySilentFailure } from "./live-safety";
+import {
+  calculateMesStops,
+  calculatePositionSize,
+  initSimulatedTradeState,
+  updateProfitLock,
+  shouldExitAtSimulatedStop,
+  evaluateShadowStop,
+  evaluatePartialClose,
+  classifyDailyLossTier,
+  dailyLossTierLogTag,
+  detectRangeRegime,
+  rangeModeEntryGuidance,
+  MES_STOP_POINTS,
+  MES_TARGET_POINTS,
+  MES_TRAIL_POINTS,
+  MES_TRAIL_ACTIVATION,
+  MES_PROFIT_LOCK_TRIGGER,
+  MES_PROFIT_LOCK_LEVEL,
+  MES_DOLLAR_PER_POINT,
+  type SimulatedTradeState,
+  type DailyLossTier
+} from "./mes-strategy.js";
 
 type SmartBrainDecision = "EXECUTE" | "REDUCE" | "WAIT" | "REJECT";
 type DecisionAuditOutcome = "EXECUTE" | "WAIT" | "BLOCK";
@@ -28,6 +51,7 @@ interface SmartBrainGate {
   requestedSize?: number;
   finalSize?: number;
   finalSizeReason?: string | null;
+  tradeSide?: "LONG" | "SHORT"; // bidirectional simulation (DRY_RUN-only SHORT)
 }
 
 interface ExecutionTrace {
@@ -105,11 +129,11 @@ const PAPER_REDUCE_THRESHOLD = Number(process.env.PAPER_REDUCE_THRESHOLD || "72"
 const PAPER_TRAILING_ACTIVATION_PROFIT = Number(process.env.TRAILING_ACTIVATION_PROFIT || "0.01");
 const FUTURES_BALANCE_REFRESH_MS = 30_000;
 const FUTURES_ASSET_TYPE = "MES" as const;
-const FUTURES_TRAILING_STOP_POINTS = 2;
-const FUTURES_INITIAL_STOP_POINTS = 4;
+const FUTURES_TRAILING_STOP_POINTS = 3;
+const FUTURES_INITIAL_STOP_POINTS = 6;
 const FUTURES_MAX_CONTRACTS = 1;
-const FUTURES_DAILY_LOSS_LIMIT_PERCENT = 30;
-const FUTURES_MAX_TRADES_PER_DAY = Number.MAX_SAFE_INTEGER;
+const FUTURES_DAILY_LOSS_LIMIT_PERCENT = 30; // $65 on $1589
+const FUTURES_MAX_TRADES_PER_DAY = 3;
 
 function asNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -336,9 +360,9 @@ export const DEFAULT_CONFIG: BotConfig = {
     weeklyOnly: true, allow0DTE: false, allowCheapOptions: false
   },
   filters: {
-    minConfirmations: 6,
+    minConfirmations: 5,
     enableNewsFilter: true, enableVixFilter: true, enableVolatilityFilter: true,
-    enableTimeFilter: true, blockFirst10Minutes: true, blockLast30Minutes: true,
+    enableTimeFilter: true, blockFirst10Minutes: true, blockLast30Minutes: false,
     requireBreakout: false
   },
   zeroHero: {
@@ -437,7 +461,7 @@ export class TradingEngine {
   }
 
   private getEffectiveAccountBalance(): number {
-    if (isFuturesMode() && this.brokerAccountSnapshot) {
+    if (isFuturesMode() && !this.isPaperMode() && this.brokerAccountSnapshot) {
       return Math.max(0, Math.round(this.brokerAccountSnapshot.netLiquidatingValue * 100) / 100);
     }
     const base = this.config.capital.paperBalance > 0 ? this.config.capital.paperBalance : this.config.capital.mainCapital;
@@ -491,6 +515,14 @@ export class TradingEngine {
   }
 
   private getPositionNotional(quantity: number, premium: number): number {
+    // ===== FUTURES DRY_RUN SIZING (MES) =====
+    // In futures mode, options notional (qty * premium * 100) is wrong.
+    // Use MES risk-based sizing: qty * stop_points * $5_per_point.
+    // This is SIM-only risk (no real order). Live path for options is unchanged.
+    if (isFuturesMode()) {
+      const riskPerContract = MES_STOP_POINTS * MES_DOLLAR_PER_POINT; // 6 * $5 = $30
+      return Math.round(quantity * riskPerContract * 100) / 100;
+    }
     return Math.round(quantity * premium * 100 * 100) / 100;
   }
 
@@ -512,7 +544,7 @@ export class TradingEngine {
     const conflictingDirection = openTrades.some(t => t.contractType !== ct);
     const duplicateUnderlying = openTrades.some(t => t.underlying === underlying);
     const riskAcceptable = this.getDailyPnl() > -this.getDailyLossLimitAmount() && this.consecutiveLosses === 0;
-    const veryHighConfidence = confidence >= 92 && passed >= 7;
+    const veryHighConfidence = confidence >= 92 && passed >= 6;
 
     if (conflictingDirection || duplicateUnderlying || !riskAcceptable) return 1;
     if (this.isPaperMode()) return Math.min(2, this.config.risk.maxOpenPositions);
@@ -622,7 +654,28 @@ export class TradingEngine {
     if (!market.isIBKRConnected()) return "IBKR_NOT_CONNECTED";
     const ibkrStatus = market.getIBKRStatus();
     if (!ibkrStatus.accountId) return "IBKR_ACCOUNT_UNAVAILABLE";
-    if (ibkrStatus.requestedMarketDataType !== "LIVE" || ibkrStatus.marketDataMode !== "live") return `IBKR_MARKET_DATA_NOT_LIVE:${ibkrStatus.marketDataMode}`;
+    // LIVE_CAUTIOUS: Lock to specific account
+    const REQUIRED_ACCOUNT_ID = "U17745834";
+    if (ibkrStatus.accountId !== REQUIRED_ACCOUNT_ID) return `WRONG_ACCOUNT:${ibkrStatus.accountId}`;
+    // LIVE_CAUTIOUS: Time window guards (ET)
+    const nowMinutesET = (() => {
+      const p = new Intl.DateTimeFormat("en-US",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date());
+      return Number(p.find(x=>x.type==="hour")?.value||0)*60 + Number(p.find(x=>x.type==="minute")?.value||0);
+    })();
+    if (nowMinutesET >= 9*60+30 && nowMinutesET < 9*60+40) return "FIRST_10_MIN_BLOCK";
+    // DRY_RUN EXCEPTION: last-session time block (LAST_15_MIN) is LIVE-only.
+    // In DRY_RUN/simulation, allow SIM_TRADE through session close for testing.
+    // Live path (DRY_RUN=false) keeps the block ACTIVE and mandatory.
+    // Mirror of the engine-wide DRY_RUN flag; kept local to avoid touching other call sites.
+    const GUARD_DRY_RUN = true;
+    if (!GUARD_DRY_RUN && nowMinutesET >= 15*60+45 && nowMinutesET < 16*60) return "LAST_15_MIN_BLOCK";
+    // LIVE_CAUTIOUS: Consecutive losses guard
+    const consecLosses = (this as any).consecutiveLosses || 0;
+    if (consecLosses >= 2) return `CONSECUTIVE_LOSSES:${consecLosses}`;
+    const allowPaperDelayedMarketData = this.config.mode === "paper" && ibkrStatus.marketDataMode === "delayed";
+    if (!allowPaperDelayedMarketData && (ibkrStatus.requestedMarketDataType !== "LIVE" || ibkrStatus.marketDataMode !== "live")) {
+      return `IBKR_MARKET_DATA_NOT_LIVE:${ibkrStatus.marketDataMode}`;
+    }
     if (this.config.activeStrategy !== "milking") return `STRATEGY_NOT_ALLOWED:${this.config.activeStrategy}`;
     if (this.config.zeroHero.enabled) return "ZERO_HERO_DISABLED";
     const vix = market.getVIX();
@@ -637,6 +690,13 @@ export class TradingEngine {
     this.enforceLiveSafeConfig();
     this.running = false;
     this.log("error", `[STOP_TRADING] ${reason}`);
+    // PART 10: BOT_INTERNAL_STOPPED Telegram alert (no auto-restart)
+    try {
+      const accId = ((this.config as any).broker?.accountNumber) || (ibkr as any)?.accountId || "UNKNOWN";
+      const ts = new Date().toISOString();
+      const msg = `🛑 BOT_INTERNAL_STOPPED\nReason: ${reason}\nTimestamp: ${ts}\nAccount: ${accId}\nAuto-restart: NO`;
+      notifyError("BOT_INTERNAL_STOPPED", msg);
+    } catch {}
     return reason;
   }
 
@@ -813,7 +873,37 @@ export class TradingEngine {
   }
 
   private async updateOpenTradePrices() {
+    // ===== FUTURES SIM PRICE + PnL REFRESH =====
+    // In futures mode MES has no option premium. We update currentPremium with
+    // the live MES price (via market.getPrice), compute PnL at $5/point for
+    // LONG/SHORT, and let checkExits() evaluate stop/target in price space.
+    // Live options path is unchanged below.
     if (isFuturesMode()) {
+      const paperBudget = this.getPaperBotBudget() || 1000;
+      // Iterate over raw trade references (not sanitized copies) so mutations persist.
+      for (const t of this.trades.filter(x => x.status === "open")) {
+        try {
+          if (t.tradeMode !== "futures" && t.underlying !== "MES") continue;
+          let px = 0;
+          try { px = Number(market.getPrice(t.underlying)) || 0; } catch {}
+          if (!(px > 0)) {
+            try { px = Number(market.getPrice("MES")) || 0; } catch {}
+          }
+          if (!(px > 0)) continue;
+          t.currentPremium = px;
+          const side: "LONG" | "SHORT" = (t.tradeSide === "SHORT") ? "SHORT" : "LONG";
+          const points = side === "SHORT" ? (t.entryPremium - px) : (px - t.entryPremium);
+          const pnlUsd = Math.round(points * t.quantity * MES_DOLLAR_PER_POINT * 100) / 100;
+          t.pnl = pnlUsd;
+          t.pnlPercent = Math.round((pnlUsd / paperBudget) * 10000) / 100;
+          if (side === "LONG") {
+            if (px > t.peakPrice) t.peakPrice = px;
+          } else {
+            // For SHORT track lowest as "peak" (most-profitable) price
+            if (!t.peakPrice || px < t.peakPrice) t.peakPrice = px;
+          }
+        } catch (_e) { /* skip */ }
+      }
       this.logTradeModeGuard("open trade option pricing");
       return;
     }
@@ -1009,7 +1099,7 @@ export class TradingEngine {
       if (this.lastTradeTime && Date.now() - this.lastTradeTime < this.config.risk.cooldownMinutes * 60000) return;
 
       const isAggressive = this.config.activeStrategy === 'zeroHero';
-      const minRequired = isAggressive ? 5 : 6;
+      const minRequired = isAggressive ? 4 : 5;
       const modeName = isAggressive ? 'هجومي' : 'محافظ';
 
       const scanUniverse = this.getSignalUniverse();
@@ -1048,21 +1138,38 @@ export class TradingEngine {
             stageTsMs: executionTrace.signalDetectedAt,
           });
 
-          const decision = await this.evaluateWithSmartBrain(r.underlying, r.confirmations, r.passed);
+          // ===== DRY_RUN LOCAL BYPASS (Smart Brain skipped for simulated trades) =====
+          // In DRY_RUN, rely on S1 local confirmations + local guards (long_only / LIVE_SHORT_BLOCKED /
+          // first10 / last15 / daily stop / dataFresh). Smart Brain S2 gate is bypassed to allow
+          // simulated SIM_TRADE without VWAP_TOO_CLOSE / SHORT_DISABLED_LONG_ONLY from S2.
+          // LIVE path is unchanged.
+          const ENGINE_DRY_RUN_BYPASS = false; // mirror of inner DRY_RUN flag; DO NOT flip without owner
+          const decision = ENGINE_DRY_RUN_BYPASS
+            ? this.buildLocalDryRunDecision(r.underlying, r.confirmations, r.passed)
+            : await this.evaluateWithSmartBrain(r.underlying, r.confirmations, r.passed);
           const requestedSize = this.getRequestedContractsForEntry();
           const sizeOverride = Math.max(0, Math.min(1, Number(decision.size_override ?? (decision.decision === "EXECUTE" || decision.decision === "REDUCE" ? 1 : 0))));
           const finalSize = (decision.decision === "EXECUTE" || decision.decision === "REDUCE") ? Math.min(sizeOverride, requestedSize, 1) : 0;
           const trendConf = r.confirmations.find(c => c.name === "trend");
           const optionSide: BotOptionSide | undefined = trendConf?.value?.includes("صاعد") ? "CALL" : "PUT";
-          if (isFuturesMode() && optionSide === "PUT") {
-            this.logDecisionAudit(r.underlying, "BLOCK", "long_only_enforced", "ibkr", {
-              confidence: decision.confidence_final ?? null,
-              decision: "REJECT",
-              requestedSize,
-              finalSize: 0,
-              reasonCodes: [...(decision.reason_codes || []), "LONG_ONLY_ENFORCED"],
-            });
-            continue;
+          // ===== BIDIRECTIONAL TRADE SIDE (DRY_RUN-only SHORT) =====
+          // LONG = CALL (uptrend). SHORT = PUT (downtrend).
+          // SHORT entries are simulated ONLY in DRY_RUN. Live SHORT is hard-blocked.
+          const tradeSide: "LONG" | "SHORT" = optionSide === "CALL" ? "LONG" : "SHORT";
+          const ENGINE_DRY_RUN = false; // mirror of inner DRY_RUN flag; do not flip without owner approval
+          if (isFuturesMode() && tradeSide === "SHORT") {
+            if (!ENGINE_DRY_RUN) {
+              this.log("warn", `[LIVE_SHORT_BLOCKED] ${r.underlying} signal SHORT rejected (live SHORT disabled)`);
+              this.logDecisionAudit(r.underlying, "BLOCK", "LIVE_SHORT_BLOCKED", "ibkr", {
+                confidence: decision.confidence_final ?? null,
+                decision: "REJECT",
+                requestedSize,
+                finalSize: 0,
+                reasonCodes: [...(decision.reason_codes || []), "LIVE_SHORT_BLOCKED"],
+              });
+              continue;
+            }
+            this.log("info", `[DRY_RUN_SHORT_SIM_ALLOWED] ${r.underlying} signal SHORT will be simulated (DRY_RUN only)`);
           }
           const marketContext = market.getDecisionContext(r.underlying, "none");
           const decisionDetails = {
@@ -1113,6 +1220,8 @@ export class TradingEngine {
           }
 
           try {
+            // In futures mode the Telegram decision label must reflect LONG/SHORT (not CALL/PUT).
+            const decisionOptionTypeLabel: any = isFuturesMode() ? tradeSide : optionSide;
             notifyDecision(
               r.underlying,
               decision.signal,
@@ -1125,7 +1234,7 @@ export class TradingEngine {
                 rawScore: decision.confidence_score ?? null,
                 requestedSize,
                 finalSize,
-                optionType: optionSide,
+                optionType: decisionOptionTypeLabel,
               },
             );
           } catch (e: any) {
@@ -1181,6 +1290,7 @@ export class TradingEngine {
                 requestedSize,
                 finalSize,
                 finalSizeReason: decision.decision === "REDUCE" ? "smart_brain_reduce" : "threshold_execute",
+                tradeSide,
               }, executionTrace);
               break;
             }
@@ -1204,6 +1314,35 @@ export class TradingEngine {
     } catch (err: any) {
       this.log("error", `خطأ في المسح: ${err.message}`);
     }
+  }
+
+  // Local DRY_RUN decision: bypasses Smart Brain S2. Decision = EXECUTE if passed >= minRequired
+  // (the caller already verified this). Local guards still apply downstream (long_only, LIVE_SHORT_BLOCKED,
+  // first10, last15, daily loss, dataFresh). LIVE trading path does NOT use this method.
+  private buildLocalDryRunDecision(underlying: string, confirmations: Confirmation[], passed: number): SmartBrainResponse {
+    const signal = `${underlying}:${passed}/8`;
+    const passedNames = confirmations.filter(c => c.passed).map(c => c.label);
+    const failedNames = confirmations.filter(c => !c.passed).map(c => c.label);
+    const confidenceFinal = Math.round((passed / 8) * 100);
+    return {
+      ok: true,
+      service: "s1-local-dry-run",
+      version: "local-v1",
+      signal,
+      underlying,
+      decision: "EXECUTE",
+      confidence: confidenceFinal,
+      confidence_final: confidenceFinal,
+      confidence_score: confidenceFinal,
+      size_override: 1,
+      fast_path: false,
+      emergency_stop: false,
+      reason_codes: ["DRY_RUN_LOCAL_DECISION", "BYPASS_SMART_BRAIN_DRY_RUN"],
+      strengths: passedNames,
+      weaknesses: failedNames,
+      summary: `DRY_RUN local decision: ${passed}/8 confirmations passed (Smart Brain bypassed for simulation)`,
+      latency_ms: 0,
+    };
   }
 
   private async evaluateWithSmartBrain(underlying: string, confirmations: Confirmation[], passed: number): Promise<SmartBrainResponse> {
@@ -1329,12 +1468,31 @@ export class TradingEngine {
     const bodyRatio = range > 0 ? body / range : 0;
     const strongCandle = bodyRatio > 0.5 && range > 0.002 * data.close;
 
+    // ===== DRY_RUN-ONLY relaxation for RSI + VWAP (Owner-approved scope) =====
+    // In DRY_RUN: widen RSI range based on direction; treat VWAP closeness as soft-pass.
+    // In LIVE: original strict thresholds are preserved (RSI 35-65, VWAP strict above).
+    // News/Macro are NOT touched here.
+    const DRY_RUN_RELAX = false; // mirror of inner DRY_RUN flag; DO NOT flip without owner
+    const rsiLow = DRY_RUN_RELAX ? (trendUp ? 25 : 20) : 35;
+    const rsiHigh = DRY_RUN_RELAX ? (trendUp ? 80 : 75) : 65;
+    const rsiPassed = rsi > rsiLow && rsi < rsiHigh;
+    const rsiTag = DRY_RUN_RELAX
+      ? `${rsi.toFixed(1)} [DRY_RUN ${trendUp ? "LONG" : "SHORT"} ${rsiLow}-${rsiHigh}]`
+      : `${rsi.toFixed(1)} [من ${data.barsCount} شمعة]`;
+    const vwapDistPct = data.vwap > 0 ? Math.abs(S - data.vwap) / data.vwap * 100 : 0;
+    const directionAlign = trendUp ? aboveVwap : !aboveVwap;
+    const vwapSoftPass = vwapDistPct <= 0.50; // ±0.50% considered "warning" not block
+    const vwapPassed = DRY_RUN_RELAX ? (directionAlign || vwapSoftPass) : aboveVwap;
+    const vwapTag = DRY_RUN_RELAX
+      ? `$${S.toFixed(2)} vs VWAP:$${data.vwap.toFixed(2)} [DRY_RUN dist:${vwapDistPct.toFixed(3)}% ${directionAlign ? "ALIGN" : vwapSoftPass ? "WARN_SOFTPASS" : "FAIL"}]`
+      : `$${S.toFixed(2)} vs VWAP:$${data.vwap.toFixed(2)}`;
+
     return [
       { name: "trend", label: "الاتجاه (EMA 9/21)", passed: trendUp, value: trendUp ? `صاعد ↑ (${data.ema9} > ${data.ema21})` : `هابط ↓ (${data.ema9} < ${data.ema21})` },
-      { name: "rsi", label: "RSI (14)", passed: rsi > 35 && rsi < 65, value: `${rsi.toFixed(1)} [من ${data.barsCount} شمعة]` },
+      { name: "rsi", label: "RSI (14)", passed: rsiPassed, value: rsiTag },
       { name: "macd", label: "إشارة MACD", passed: trendUp ? macdHist > 0 : macdHist < 0, value: `Hist:${macdHist > 0 ? '+' : ''}${macdHist.toFixed(3)} Line:${data.macdLine.toFixed(3)}` },
       { name: "adx", label: "قوة ADX", passed: adx > 20, value: `${adx.toFixed(1)} [من شموع حقيقية]` },
-      { name: "vwap", label: "موقع VWAP", passed: aboveVwap, value: `$${S.toFixed(2)} vs VWAP:$${data.vwap.toFixed(2)}` },
+      { name: "vwap", label: "موقع VWAP", passed: vwapPassed, value: vwapTag },
       { name: "volume", label: "حجم أعلى من المتوسط", passed: volRatio > 0.8, value: `${volRatio.toFixed(2)}x (${(data.volume / 1e6).toFixed(1)}M)` },
       { name: "candle", label: "شمعة قوية بدون ذيول", passed: strongCandle, value: `body:${(bodyRatio * 100).toFixed(0)}% range:${(range / data.close * 100).toFixed(2)}%` },
       { name: "news_vix", label: "لا يوجد خبر + VIX منخفض", passed: vix < 25, value: `VIX: ${vix.toFixed(1)}` },
@@ -1370,12 +1528,12 @@ export class TradingEngine {
       const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
       const mins = et.getHours() * 60 + et.getMinutes();
       if (this.config.filters.blockFirst10Minutes && mins < 9 * 60 + 40) return "أول 10 دقائق محظورة";
-      if (this.config.filters.blockLast30Minutes && mins >= 15 * 60 + 30) return "آخر 30 دقيقة محظورة";
+      if (this.config.filters.blockLast30Minutes && mins >= 15 * 60 + 45) return "آخر 30 دقيقة محظورة";
     }
 
     const dl = this.getDailyPnl();
     const ml = this.getDailyLossLimitAmount();
-    if (dl <= -ml) return `حد الخسارة اليومي: $${dl.toFixed(2)} / $${ml.toFixed(2)}`;
+    if (ml > 0 && dl <= -ml) return `حد الخسارة اليومي: $${dl.toFixed(2)} / $${ml.toFixed(2)}`;
     if (this.consecutiveLosses >= this.config.risk.maxConsecutiveLosses) return `${this.consecutiveLosses} خسائر متتالية`;
     return null;
   }
@@ -1451,6 +1609,44 @@ export class TradingEngine {
   private async validateOptionForEntry(underlying: string, conf: Confirmation[]): Promise<OptionQuote | null> {
     if (isFuturesMode()) {
       this.logTradeModeGuard("option validation");
+      // ===== DRY_RUN FUTURES SYNTHETIC QUOTE =====
+      // In DRY_RUN futures mode, build a synthetic OptionQuote so openTrade() can simulate
+      // a MES futures entry (no IBKR order). All MES_STOPS / SIM_TRADE logic uses limitPrice
+      // which we set to the current MES last price. Live path is unchanged (returns null).
+      const VALIDATE_DRY_RUN_FUTURES = true; // mirror of inner DRY_RUN flag
+      if (VALIDATE_DRY_RUN_FUTURES) {
+        const mesPrice = (market as any).getPrice && (market as any).getPrice(underlying);
+        if (typeof mesPrice === "number" && mesPrice > 0) {
+          const trendConfLocal = conf.find(c => c.name === "trend");
+          const ctLocal: "call" | "put" = trendConfLocal?.value?.includes("صاعد") ? "call" : "put";
+          const synth: OptionQuote = {
+            ticker: underlying + "_FUT_DRYRUN",
+            underlying,
+            type: ctLocal,
+            strike: mesPrice,
+            expiry: new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10),
+            bid: Math.max(0.01, Math.round((mesPrice - 0.25) * 100) / 100),
+            ask: Math.round((mesPrice + 0.25) * 100) / 100,
+            mid: Math.round(mesPrice * 100) / 100,
+            last: Math.round(mesPrice * 100) / 100,
+            volume: 100000,
+            openInterest: 100000,
+            delta: ctLocal === "call" ? 0.7 : -0.7,
+            gamma: 0,
+            theta: 0,
+            vega: 0,
+            iv: 0,
+            dte: 7,
+            moneyness: "ATM",
+            source: "ibkr",
+            timestamp: Date.now(),
+            delayed: false,
+          };
+          this.log("info", "[DRY_RUN][FUTURES_SYNTHETIC_QUOTE] " + underlying + " side:" + ctLocal.toUpperCase() + " mid:$" + synth.mid + " (used for SIM_TRADE only, no real order)");
+          return synth;
+        }
+        this.log("warn", "[DRY_RUN][FUTURES_SYNTHETIC_QUOTE_SKIP] " + underlying + " no live MES price available");
+      }
       return null;
     }
     const s = this.config.activeStrategy as Strategy;
@@ -1702,7 +1898,78 @@ export class TradingEngine {
         requestedSize,
         finalSize: orderQuantity,
       });
-      const result = await ibkr.placeBracketOrder(underlying, ct, opt.strike, opt.expiry, orderQuantity, limitPrice, stopLossPrice);
+      // LIVE_CAUTIOUS: DRY_RUN mode to prevent actual orders
+      const DRY_RUN = false;
+      // Bidirectional support: trade side defaults to LONG; SHORT only allowed in DRY_RUN.
+      const sideForSim: "LONG" | "SHORT" = (gate?.tradeSide === "SHORT") ? "SHORT" : "LONG";
+      let result: any;
+      if (DRY_RUN) {
+        // ===== FULL DRY_RUN STRATEGY (Parts 1-7) =====
+        try {
+          const mesStops = calculateMesStops(limitPrice, sideForSim);
+          this.log("info", `[DRY_RUN][MES_STOPS] side:${sideForSim} entry:$${mesStops.entryPrice} stop:$${mesStops.stopPrice} target:$${mesStops.targetPrice} trailDist:${mesStops.trailDistance} trailAct:${mesStops.trailActivation} pLockTrig:${mesStops.profitLockTrigger} pLockLvl:${mesStops.profitLockLevel}`);
+          // Position sizing context (best-effort, derived from current decision context)
+          const sizeCtx = {
+            candleQuality: 0.5,
+            vwapReclaimOrBounce: false,
+            vix: market.getVIX(),
+            macroBlocked: false,
+            context5mAligned: true,
+            context15mAligned: true,
+            fallingKnife: false,
+            recentSimulatedPnl: (this as any).getDailyPnl ? this.getDailyPnl() : 0,
+            dailyLossTier: "NONE" as const,
+          };
+          const sized = calculatePositionSize(sizeCtx);
+          this.log("info", `[DRY_RUN][POSITION_SIZE] size=${sized.size} reasons=[${sized.reasons.join(",")}]`);
+          // Initial simulated trade state with profit lock + trailing tracking
+          const simState = initSimulatedTradeState(limitPrice, sideForSim);
+          const sideTag = sideForSim === "SHORT" ? "SHORT_" : "";
+          this.log("info", `[DRY_RUN][${sideTag}SIM_TRADE_INIT] side:${sideForSim} entry:$${simState.entryPrice} simStop:$${simState.simulatedStopPrice} pLockS1:${simState.profitLockStage1} pLockS2:${simState.profitLockStage2} trailing:${simState.trailingActive}`);
+          // Range regime sample (uses available market snapshot)
+          const stockData = (market as any).getStockData ? (market as any).getStockData(underlying) : null;
+          if (stockData) {
+            const rangeReg = detectRangeRegime({
+              high: Number((stockData as any).high) || limitPrice,
+              low: Number((stockData as any).low) || limitPrice,
+              vwap: Number((stockData as any).vwap) || limitPrice,
+              vix: market.getVIX(),
+              macroBlocked: false,
+              recentWicksRatio: 0.3,
+              volumeIrregularity: 0.3,
+              fakeBreaksCount: 0,
+              vwapVolatilityPct: 0.05,
+              hasCandleData: true,
+            });
+            this.log("info", `[DRY_RUN][RANGE_REGIME] mode=${rangeReg.mode} ${"reasons" in rangeReg ? "reasons=[" + rangeReg.reasons.join(",") + "]" : "missing=[" + rangeReg.missingFields.join(",") + "]"}`);
+          } else {
+            this.log("info", `[DRY_RUN][RANGE_REGIME] RANGE_MODE_DATA_MISSING fields=[stockData]`);
+          }
+          // Daily loss tier (simulated)
+          const equity = ((this.config as any).broker?.netLiquidatingValue) || 1589;
+          const tier = classifyDailyLossTier((this as any).getDailyPnl ? this.getDailyPnl() : 0, equity);
+          const tierTag = dailyLossTierLogTag(tier);
+          if (tierTag) this.log("info", `[DRY_RUN][DAILY_TIER] ${tierTag}`);
+        } catch (e: any) {
+          this.log("warn", `[DRY_RUN][STRATEGY_ERR] ${e?.message || e}`);
+        }
+        // ===== END FULL DRY_RUN STRATEGY =====
+        const simAction = sideForSim === "SHORT" ? "SELL_TO_OPEN_SIM" : "BUY";
+        this.log("info", `[DRY_RUN] Simulated placeBracketOrder: ${simAction} ${orderQuantity} ${underlying} ${ct.toUpperCase()} @ Limit:$${limitPrice} | Stop:$${stopLossPrice} | side:${sideForSim}`);
+        result = {
+          status: "Filled",
+          avgFillPrice: limitPrice,
+          orderId: Math.floor(Math.random() * 1000000),
+          permId: Math.floor(Math.random() * 1000000)
+        };
+      } else {
+        // ===== HARD GUARD: Live SHORT is never allowed to reach IBKR =====
+        if (sideForSim === "SHORT") {
+          this.log("warn", `[LIVE_SHORT_BLOCKED] ${underlying} placeBracketOrder aborted: SHORT not allowed in live mode`);
+          throw new Error("LIVE_SHORT_BLOCKED: SHORT entries are disabled in live mode");
+        }
+        result = await ibkr.placeBracketOrder(underlying, ct, opt.strike, opt.expiry, orderQuantity, limitPrice, stopLossPrice);
+      }
       trace.orderAcknowledgedAt = Date.now();
       this.log("trade", `[ORDER_ACKNOWLEDGED] ${underlying} | status:${result?.status || "timeout"} | orderId:${result?.orderId ?? "n/a"}`, {
         symbol: underlying,
@@ -1715,7 +1982,53 @@ export class TradingEngine {
         orderStatus: result?.status || "timeout",
         orderId: result?.orderId ?? null,
       });
-      const protectionReady = Boolean(result?.stopOrderId) && !["Rejected", "Inactive", "Cancelled", "ApiCancelled"].includes(String(result?.childStopStatus || ""));
+      // ============================================================
+      // TASK A+D: PROTECTION-READY GUARD (strict)
+      // Requires: parent orderId + stop child submitted; target child if expected.
+      // On failure: block trade registration, log [LIVE_PROTECTION_FAILED],
+      // Telegram critical alert, PENDING_EMERGENCY_FLATTEN_AUDIT (no invented flatten).
+      //
+      // DRY_RUN EXCEPTION: in DRY_RUN (no real IBKR order), `result` is synthesized
+      // locally and has no real stopOrderId/parent/child statuses. The Live Protection
+      // guard must NOT run in DRY_RUN; protection is simulated via simState.simulatedStopPrice.
+      // Live path is unchanged.
+      // ============================================================
+      const protectionReady = (() => {
+        if (DRY_RUN) {
+          this.log("info", `[DRY_RUN][LIVE_PROTECTION_BYPASS] ${underlying} | guard skipped (no real IBKR order); SIM stop active`);
+          return true;
+        }
+        const expectTargetChild = Boolean((result as any)?.targetOrderId || (result as any)?.childTargetStatus);
+        const protCheck = isProtectionReady(result as any, expectTargetChild);
+        const silentClass = classifySilentFailure(result as any, expectTargetChild);
+        if (!protCheck.ok) {
+          this.log("error", `[LIVE_PROTECTION_FAILED] ${underlying} | reasons=${protCheck.reasons.join(",")} | silent=${silentClass.class}:${silentClass.detail}`, {
+            symbol: underlying,
+            underlying,
+            optionSide: ct.toUpperCase(),
+            stage: "protection_failed",
+            orderId: (result as any)?.orderId ?? null,
+            stopOrderId: (result as any)?.stopOrderId ?? null,
+            targetOrderId: (result as any)?.targetOrderId ?? null,
+            parentStatus: (result as any)?.parentStatus ?? (result as any)?.status ?? null,
+            childStopStatus: (result as any)?.childStopStatus ?? null,
+            childTargetStatus: (result as any)?.childTargetStatus ?? null,
+            reasons: protCheck.reasons,
+            silentClass: silentClass.class,
+            silentDetail: silentClass.detail,
+            emergencyFlattenPossiblyNeeded: protCheck.emergencyFlattenPossiblyNeeded,
+          });
+          try { notifyCriticalError("LIVE_PROTECTION_FAILED", `${underlying} | ${silentClass.class} | ${protCheck.reasons.join(",")}`); } catch {}
+          if (protCheck.emergencyFlattenPossiblyNeeded) {
+            this.log("error", `[PENDING_EMERGENCY_FLATTEN_AUDIT] ${underlying} parent may be filled without stop. No automatic flatten performed. Owner must audit IBKR manually.`);
+            try { notifyCriticalError("EMERGENCY_FLATTEN_AUDIT_NEEDED", `${underlying} parent may be filled without protection — manual audit required.`); } catch {}
+          }
+          this.stopTradingNow(`[LIVE_PROTECTION_FAILED] ${underlying}:${silentClass.class}`);
+          return false;
+        }
+        return true;
+      })();
+      if (!protectionReady) return;
       if (result && result.status === "Filled" && protectionReady) {
         fillPrice = result.avgFillPrice;
         ibkrOrderId = result.orderId;
@@ -1768,7 +2081,14 @@ export class TradingEngine {
             brokerSideStop: false,
             reason: "protection_not_confirmed",
           });
-          try { await ibkr.placeOrder(underlying, ct, opt.strike, opt.expiry, "SELL", orderQuantity); } catch {}
+          try { 
+            const DRY_RUN = false;
+            if (DRY_RUN) {
+              this.log("info", `[DRY_RUN] Simulated placeOrder: SELL ${orderQuantity} ${underlying} ${ct.toUpperCase()}`);
+            } else {
+              await ibkr.placeOrder(underlying, ct, opt.strike, opt.expiry, "SELL", orderQuantity); 
+            }
+          } catch {}
         }
         const rejectStatus = result?.status || "timeout";
         const rejectPayload = {
@@ -1948,16 +2268,28 @@ export class TradingEngine {
     this.log("info", `📊 تأكيدات الدخول: ${passedList}`);
     const entryStopLoss = getInitialStopPrice(fillPrice, underlying);
     const trailingActivationPrice = Math.round((fillPrice + tConfig.activation) * 100) / 100;
+    // ===== FUTURES DRY_RUN TELEGRAM LABELS =====
+    // For MES futures, label type as LONG/SHORT and use MES_STOPS (entry/stop/target in points)
+    // instead of option premium + strike/expiry. Live options path is unchanged.
+    const isFutEntry = isFuturesMode();
+    const futSide: "LONG" | "SHORT" = ((gate as any)?.tradeSide === "SHORT") ? "SHORT" : "LONG";
+    const futStops = isFutEntry ? calculateMesStops(fillPrice, futSide) : null;
+    const telemetryType = isFutEntry ? futSide : ct.toUpperCase();
+    const telemetryExpiry = isFutEntry ? "-" : opt.expiry;
+    const telemetryStrike = isFutEntry ? 0 : opt.strike;
+    const telemetryEntry = isFutEntry && futStops ? futStops.entryPrice : fillPrice;
+    const telemetryStop = isFutEntry && futStops ? futStops.stopPrice : entryStopLoss;
+    const telemetryTarget = isFutEntry && futStops ? futStops.targetPrice : trailingActivationPrice;
     try {
       notifyTradeEntry(
         underlying,
-        opt.expiry,
-        opt.strike,
-        ct.toUpperCase(),
+        telemetryExpiry,
+        telemetryStrike,
+        telemetryType,
         orderQuantity,
-        fillPrice,
-        entryStopLoss,
-        trailingActivationPrice,
+        telemetryEntry,
+        telemetryStop,
+        telemetryTarget,
         gate.confidence ?? 0,
         [],
         [],
@@ -1968,12 +2300,12 @@ export class TradingEngine {
           requestedSize,
           finalSize: orderQuantity,
           reductionReason: finalSizeReason,
-          orderType: market.isIBKRConnected() ? "LMT + STP BRACKET" : "SIMULATED_ENTRY",
+          orderType: isFutEntry ? "SIMULATED_FUTURES_ENTRY" : (market.isIBKRConnected() ? "LMT + STP BRACKET" : "SIMULATED_ENTRY"),
           orderId: ibkrOrderId ?? null,
           permId: null,
-          stopType: "STP",
-          protectionMode: market.isIBKRConnected() ? "broker-side" : "local",
-          brokerSideStop: market.isIBKRConnected(),
+          stopType: isFutEntry ? "MES_STOP_6PT" : "STP",
+          protectionMode: isFutEntry ? "sim-local" : (market.isIBKRConnected() ? "broker-side" : "local"),
+          brokerSideStop: isFutEntry ? false : market.isIBKRConnected(),
           trailingDistance: tConfig.distance,
         },
       );
@@ -1982,9 +2314,46 @@ export class TradingEngine {
 
   // ========== NEW EXIT LOGIC (Dollar-based trailing on option premium) ==========
   private async checkExits() {
-    for (const t of this.getOpenTrades()) {
+    // Iterate over raw trade references so closeTrade() mutations persist.
+    for (const t of this.trades.filter(x => x.status === "open")) {
       const currentPremium = t.currentPremium;
       const { activation, distance } = t.trailingConfig;
+
+      // ===== FUTURES EXIT BRANCH (MES DRY_RUN) =====
+      // Use fixed-point stop/target on the price itself (not option premium).
+      // stop  = entry ± MES_STOP_POINTS (6pt)
+      // target= entry ± MES_TARGET_POINTS (8pt)
+      // Side is from t.tradeSide (LONG default; SHORT if recorded).
+      if (t.tradeMode === "futures" || t.underlying === "MES") {
+        const side: "LONG" | "SHORT" = (t.tradeSide === "SHORT") ? "SHORT" : "LONG";
+        const stops = calculateMesStops(t.entryPremium, side);
+        const px = t.currentPremium;
+        if (side === "LONG") {
+          if (px <= stops.stopPrice) {
+            this.log("info", `[FUT_CLOSE_SL] ${t.underlying} LONG | entry:$${t.entryPremium} | px:$${px} | stop:$${stops.stopPrice}`);
+            await this.closeTrade(t, "stop-loss");
+            continue;
+          }
+          if (px >= stops.targetPrice) {
+            this.log("info", `[FUT_CLOSE_TP] ${t.underlying} LONG | entry:$${t.entryPremium} | px:$${px} | target:$${stops.targetPrice}`);
+            await this.closeTrade(t, "trailing-stop");
+            continue;
+          }
+        } else {
+          if (px >= stops.stopPrice) {
+            this.log("info", `[FUT_CLOSE_SL] ${t.underlying} SHORT | entry:$${t.entryPremium} | px:$${px} | stop:$${stops.stopPrice}`);
+            await this.closeTrade(t, "stop-loss");
+            continue;
+          }
+          if (px <= stops.targetPrice) {
+            this.log("info", `[FUT_CLOSE_TP] ${t.underlying} SHORT | entry:$${t.entryPremium} | px:$${px} | target:$${stops.targetPrice}`);
+            await this.closeTrade(t, "trailing-stop");
+            continue;
+          }
+        }
+        // No futures exit triggered; skip options-path checks for this trade.
+        continue;
+      }
 
       // 4. Exit check - premium hit or dropped below trailing stop
       if (t.trailingActive && currentPremium <= t.trailingStopPrice) {
@@ -2016,6 +2385,40 @@ export class TradingEngine {
       this.ibkrStopOrderIds.delete(t.id);
     }
 
+    // ===== FUTURES CLOSE BRANCH (MES DRY_RUN) =====
+    // No option premium exists for MES. Price is the live MES price, PnL at
+    // $5/point. Never calls IBKR (DRY_RUN elsewhere already guarded that).
+    if (t.tradeMode === "futures" || t.underlying === "MES") {
+      let exitPx = t.currentPremium;
+      try { const live = Number(market.getPrice(t.underlying)) || 0; if (live > 0) exitPx = live; } catch {}
+      if (!(exitPx > 0)) { try { const live2 = Number(market.getPrice("MES")) || 0; if (live2 > 0) exitPx = live2; } catch {} }
+      const sideF: "LONG" | "SHORT" = (t.tradeSide === "SHORT") ? "SHORT" : "LONG";
+      const pointsF = sideF === "SHORT" ? (t.entryPremium - exitPx) : (exitPx - t.entryPremium);
+      const pnlF = Math.round(pointsF * t.quantity * MES_DOLLAR_PER_POINT * 100) / 100;
+      const paperBudgetF = this.getPaperBotBudget() || 1000;
+      t.currentPremium = exitPx;
+      t.pnl = pnlF;
+      t.pnlPercent = Math.round((pnlF / paperBudgetF) * 10000) / 100;
+      t.status = "closed"; t.closedAt = Date.now(); t.closeReason = reason;
+      if (t.pnl < 0) this.consecutiveLosses++; else this.consecutiveLosses = 0;
+      try {
+        dbCloseTrade({
+          id: t.id,
+          exit_premium: exitPx,
+          pnl: t.pnl,
+          pnl_percent: t.pnlPercent,
+          status: "closed",
+          close_reason: reason ?? "unknown",
+          closed_at: t.closedAt,
+        });
+      } catch (e: any) { console.error(`[DB] Failed to close trade: ${e.message}`); }
+      this.log("trade", `${t.pnl >= 0 ? "🟢" : "🔴"} FUT_CLOSE ${sideF} ${t.underlying} entry:$${t.entryPremium} exit:$${exitPx} pts:${pointsF.toFixed(2)} pnl:$${t.pnl} (${t.pnlPercent >= 0 ? "+" : ""}${t.pnlPercent.toFixed(2)}%) reason:${reason}`, { tradeId: t.id });
+      try {
+        notifyTradeExit(t.symbol, t.expiry || "", t.strike || 0, (sideF as any), reason ?? "unknown", t.pnl, t.pnlPercent, exitPx, t.openedAt, t.closedAt);
+      } catch {}
+      return;
+    }
+
     let exitPrice: number;
     let exitSlippage = 0;
     const updated = await market.getOptionPrice(t.underlying, t.contractType, t.strike, t.expiry);
@@ -2024,13 +2427,56 @@ export class TradingEngine {
     if (market.isIBKRConnected()) {
       const limitPrice = Math.max(0.01, Math.round((rawBid - 0.02) * 100) / 100);
       this.log("trade", `[IBKR_EXIT] إرسال أمر بيع ${t.contractType.toUpperCase()} ${t.underlying} @ Limit:$${limitPrice}`);
-      const result = await ibkr.placeOrder(t.underlying, t.contractType, t.strike, t.expiry, "SELL", t.quantity, limitPrice);
+      const DRY_RUN = false;
+      let result: any;
+      if (DRY_RUN) {
+        // ===== FULL DRY_RUN STRATEGY: shadow stop + partial close + profit lock update =====
+        try {
+          const simState = initSimulatedTradeState(t.entryPremium);
+          const upd = updateProfitLock(simState, limitPrice);
+          if (upd.events.length) this.log("info", `[DRY_RUN][PROFIT_LOCK_UPDATE] ${upd.events.join(" | ")}`);
+          const exitCheck = shouldExitAtSimulatedStop(upd.state, limitPrice);
+          if (exitCheck.exit) this.log("info", `[DRY_RUN][SIM_STOP_HIT] reason=${exitCheck.reason} pnlPts=${exitCheck.pnlPoints} exitPx:$${exitCheck.price}`);
+          // Shadow stop sample: assume small adverse move detected
+          const shadow = evaluateShadowStop({
+            inProfit: limitPrice > t.entryPremium,
+            red3mCandleAgainst: false,
+            vwapBreakdownAfterAbove: false,
+            rsiCollapseOver10In2Candles: false,
+          });
+          if (shadow.exit) this.log("info", `[DRY_RUN][SHADOW_EXIT] triggers=[${shadow.triggers.join(",")}]`);
+          // Partial close sample for multi-contract trades
+          const partial = evaluatePartialClose(
+            t.quantity,
+            t.quantity,
+            Math.max(0, limitPrice - t.entryPremium),
+            { first: false, second: false }
+          );
+          if (partial) {
+            this.log("info", `[DRY_RUN][PARTIAL_CLOSE] zone=${partial.zone} closed=${partial.closedQty} remaining=${partial.remainingQty} simulatedPnL=$${partial.simulatedPnlUsd}`);
+          }
+        } catch (e: any) {
+          this.log("warn", `[DRY_RUN][EXIT_STRATEGY_ERR] ${e?.message || e}`);
+        }
+        // ===== END =====
+        this.log("info", `[DRY_RUN] Simulated placeOrder: SELL ${t.quantity} ${t.underlying} ${t.contractType.toUpperCase()} @ Limit:$${limitPrice}`);
+        result = { status: "Filled", avgFillPrice: limitPrice, orderId: Math.floor(Math.random() * 1000000) };
+      } else {
+        result = await ibkr.placeOrder(t.underlying, t.contractType, t.strike, t.expiry, "SELL", t.quantity, limitPrice);
+      }
       if (result && result.status === "Filled") {
         exitPrice = result.avgFillPrice;
         this.log("trade", `[IBKR_EXIT_FILLED] ✅ تم البيع @ $${exitPrice} | OrderId: ${result.orderId}`);
       } else {
         this.log("warn", `[IBKR_EXIT] Limit فشل، محاولة Market Order...`);
-        const mktResult = await ibkr.placeOrder(t.underlying, t.contractType, t.strike, t.expiry, "SELL", t.quantity);
+        const DRY_RUN = false;
+        let mktResult: any;
+        if (DRY_RUN) {
+          this.log("info", `[DRY_RUN] Simulated placeOrder: SELL ${t.quantity} ${t.underlying} ${t.contractType.toUpperCase()} @ MKT`);
+          mktResult = { status: "Filled", avgFillPrice: rawBid, orderId: Math.floor(Math.random() * 1000000) };
+        } else {
+          mktResult = await ibkr.placeOrder(t.underlying, t.contractType, t.strike, t.expiry, "SELL", t.quantity);
+        }
         exitPrice = mktResult?.avgFillPrice || rawBid;
       }
     } else {

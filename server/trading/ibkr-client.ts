@@ -2,8 +2,114 @@
  * IBKR Client - Connects to IB Gateway via TWS API
  * Uses @stoqey/ib library for real-time market data and order execution
  */
-import { IBApi, EventName, Contract, Order, OrderAction, OrderType, SecType, BarSizeSetting, WhatToShow } from "@stoqey/ib";
+import IB from "ib";
 import { assertOptionsRuntimeAllowed } from "./trade-mode.js";
+
+type IBApi = any;
+type Contract = Record<string, any>;
+type Order = Record<string, any>;
+type OrderAction = "BUY" | "SELL";
+
+type MarketDataMode = "live" | "delayed" | "unknown";
+
+const EventName = {
+  connected: "connected",
+  disconnected: "disconnected",
+  error: "error",
+  nextValidId: "nextValidId",
+  managedAccounts: "managedAccounts",
+  currentTime: "currentTime",
+  marketDataType: "marketDataType",
+  tickPrice: "tickPrice",
+  tickSize: "tickSize",
+  tickOptionComputation: "tickOptionComputation",
+  orderStatus: "orderStatus",
+  contractDetails: "contractDetails",
+  contractDetailsEnd: "contractDetailsEnd",
+  securityDefinitionOptionParameter: "securityDefinitionOptionParameter",
+  securityDefinitionOptionParameterEnd: "securityDefinitionOptionParameterEnd",
+  historicalData: "historicalData",
+  accountSummary: "accountSummary",
+  accountSummaryEnd: "accountSummaryEnd",
+} as const;
+
+const SecType = {
+  STK: "STK",
+  IND: "IND",
+  FUT: "FUT",
+  OPT: "OPT",
+} as const;
+
+const OrderType = {
+  LMT: "LMT",
+  MKT: "MKT",
+  STP: "STP",
+} as const;
+
+function parseHistoricalDateToEpochSeconds(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = String(value ?? "").trim();
+  if (!text) return 0;
+  if (/^\d{8}$/.test(text)) {
+    const year = Number(text.slice(0, 4));
+    const month = Number(text.slice(4, 6)) - 1;
+    const day = Number(text.slice(6, 8));
+    return Math.floor(Date.UTC(year, month, day) / 1000);
+  }
+  if (/^\d+$/.test(text) && text.length <= 10) return Number(text);
+  const normalized = text.replace(/\s{2,}/g, " ");
+  const parsed = Date.parse(`${normalized} UTC`);
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 0;
+}
+
+function normalizeMarketDataMode(marketDataType: number): MarketDataMode {
+  if (marketDataType === 1) return "live";
+  if (marketDataType === 2 || marketDataType === 3 || marketDataType === 4) return "delayed";
+  return "unknown";
+}
+
+function extractConIdFromContractDetails(details: any): number | null {
+  const candidate = details?.contract?.conId ?? details?.summary?.conId ?? details?.conId ?? null;
+  return typeof candidate === "number" && candidate > 0 ? candidate : null;
+}
+
+function isHistoricalDataFinishedMarker(value: unknown): boolean {
+  return String(value ?? "").toLowerCase().startsWith("finished");
+}
+
+function isIgnorableIbInfoCode(code: number): boolean {
+  return code === 2104 || code === 2106 || code === 2158;
+}
+
+function isWarningIbCode(code: number): boolean {
+  return code === 2103 || code === 2105;
+}
+
+function isRelevantRequestId(reqId: number): boolean {
+  return Number.isFinite(reqId) && reqId > 0;
+}
+
+function hasEventEmitterOff(target: any): target is { off: (event: string, listener: (...args: any[]) => void) => void } {
+  return !!target && typeof target.off === "function";
+}
+
+function hasEventEmitterRemoveListener(target: any): target is { removeListener: (event: string, listener: (...args: any[]) => void) => void } {
+  return !!target && typeof target.removeListener === "function";
+}
+
+function removeListenerSafe(target: any, event: string, listener: (...args: any[]) => void): void {
+  if (hasEventEmitterOff(target)) {
+    target.off(event, listener);
+    return;
+  }
+  if (hasEventEmitterRemoveListener(target)) {
+    target.removeListener(event, listener);
+  }
+}
+
+function createIbClient(options: { host: string; port: number; clientId: number }): IBApi {
+  return new (IB as any)(options);
+}
 
 const IBKR_HOST = process.env.IBKR_HOST || "127.0.0.1";
 const IBKR_PORT = parseInt(process.env.IBKR_PORT || "4002");
@@ -80,9 +186,11 @@ export interface IBKROrderResult {
   avgFillPrice: number;
   lastFillPrice: number;
   stopOrderId?: number;
+  targetOrderId?: number;          // Task B: 3-leg bracket (optional)
   permId?: number;
   parentStatus?: string;
   childStopStatus?: string;
+  childTargetStatus?: string;      // Task B: 3-leg bracket (optional)
   code?: number;
   errorMessage?: string;
   rejectReason?: string;
@@ -107,9 +215,11 @@ class IBKRClient {
   private nextOrderId = 0;
   private accountId = "";
   private reqId = 1000;
-  private latestMarketDataMode: "live" | "delayed" | "unknown" = IBKR_MARKET_DATA_TYPE === 1 ? "unknown" : "delayed";
-  private tickerFeedModes = new Map<string, "live" | "delayed">();
+  private latestMarketDataMode: MarketDataMode = IBKR_MARKET_DATA_TYPE === 1 ? "unknown" : "delayed";
+  private tickerFeedModes = new Map<string, Exclude<MarketDataMode, "unknown">>();
   private lastAccountSummary: IBKRAccountSummary | null = null;
+  private connectPromise: Promise<boolean> | null = null;
+  private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // Data storage
   private stockPrices = new Map<string, IBKRStockData>();
@@ -125,57 +235,114 @@ class IBKRClient {
     return this.reqId++;
   }
 
+  private clearConnectTimeout(): void {
+    if (this.connectTimeout) {
+      clearTimeout(this.connectTimeout);
+      this.connectTimeout = null;
+    }
+  }
+
+  private cleanupConnectionState(options: { disconnectSocket?: boolean } = {}): void {
+    const { disconnectSocket = false } = options;
+    const client = this.ib as (IBApi & { removeAllListeners?: () => void }) | null;
+
+    this.clearConnectTimeout();
+
+    if (client?.removeAllListeners) {
+      try { client.removeAllListeners(); } catch {}
+    }
+
+    if (disconnectSocket && client) {
+      try { client.disconnect(); } catch {}
+    }
+
+    for (const [, pending] of this.pendingRequests.entries()) {
+      clearTimeout(pending.timeout);
+      try {
+        pending.reject(new Error("[IBKR] Connection lost"));
+      } catch {}
+    }
+    this.pendingRequests.clear();
+
+    this.ib = null;
+    this.connected = false;
+    this.connecting = false;
+    this.connectPromise = null;
+    this.accountId = "";
+    this.nextOrderId = 0;
+    this.latestMarketDataMode = IBKR_MARKET_DATA_TYPE === 1 ? "unknown" : "delayed";
+    this.lastAccountSummary = null;
+    this.tickerReqMap.clear();
+    this.tickerFeedModes.clear();
+    this.underlyingConIds.clear();
+  }
+
   async connect(): Promise<boolean> {
-    if (this.connected) return true;
-    if (this.connecting) {
-      // Wait for existing connection attempt
-      await new Promise(r => setTimeout(r, 3000));
-      return this.connected;
+    if (this.connected && this.ib) return true;
+    if (this.connectPromise) return this.connectPromise;
+
+    if (this.ib) {
+      this.cleanupConnectionState({ disconnectSocket: true });
     }
 
     this.connecting = true;
     console.log(`[IBKR] Connecting to ${IBKR_HOST}:${IBKR_PORT} (clientId: ${IBKR_CLIENT_ID})...`);
 
-    return new Promise((resolve) => {
+    this.connectPromise = new Promise((resolve) => {
+      let settled = false;
+      const finalize = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        this.clearConnectTimeout();
+        this.connecting = false;
+        this.connectPromise = null;
+        resolve(ok);
+      };
+
       try {
-        this.ib = new IBApi({ host: IBKR_HOST, port: IBKR_PORT, clientId: IBKR_CLIENT_ID });
+        const client = createIbClient({ host: IBKR_HOST, port: IBKR_PORT, clientId: IBKR_CLIENT_ID });
+        this.ib = client;
 
         // Connection events
-        this.ib.on(EventName.connected, () => {
+        client.on(EventName.connected, () => {
+          if (this.ib !== client) return;
           console.log("[IBKR] Connected to IB Gateway!");
           this.connected = true;
           this.connecting = false;
+          this.clearConnectTimeout();
           // Use LIVE market data in live trading, otherwise fall back to DELAYED.
-          this.ib!.reqMarketDataType(IBKR_MARKET_DATA_TYPE);
+          client.reqMarketDataType(IBKR_MARKET_DATA_TYPE);
           console.log(`[IBKR] Market data type set to ${IBKR_MARKET_DATA_TYPE_LABEL} (${IBKR_MARKET_DATA_TYPE}) for TRADING_MODE=${IBKR_TRADING_MODE}`);
-          this.ib!.reqCurrentTime();
-          this.ib!.reqManagedAccts();
-          resolve(true);
+          client.reqCurrentTime();
+          client.reqManagedAccts();
+          client.reqIds(1);
+          finalize(true);
         });
 
-        this.ib.on(EventName.disconnected, () => {
+        client.on(EventName.disconnected, () => {
+          if (this.ib !== client) return;
           console.log("[IBKR] Disconnected from IB Gateway");
-          this.connected = false;
-          this.connecting = false;
+          const wasConnected = this.connected;
+          this.cleanupConnectionState({ disconnectSocket: false });
+          if (!wasConnected) finalize(false);
         });
 
-        this.ib.on(EventName.error, (err: Error & { advancedOrderRejectJson?: string }, code: number, reqId: number, advancedOrderRejectJson?: string) => {
+        client.on(EventName.error, (err: Error, data?: { id?: number; code?: number }) => {
+          if (this.ib !== client) return;
+          const code = Number(data?.code ?? -1);
+          const reqId = Number(data?.id ?? -1);
           const errorMessage = err?.message || String(err);
           const msg = `[IBKR] Error: ${errorMessage} (code: ${code}, reqId: ${reqId})`;
-          const advancedReject = advancedOrderRejectJson || err?.advancedOrderRejectJson || undefined;
 
-          // Don't log non-critical errors
-          if (code === 2104 || code === 2106 || code === 2158) {
-            // Market data farm connection messages - informational
+          if (isIgnorableIbInfoCode(code)) {
             console.log(`[IBKR] Info: ${errorMessage}`);
-          } else if (code === 2103 || code === 2105) {
+          } else if (isWarningIbCode(code)) {
             console.warn(`[IBKR] Warning: ${errorMessage}`);
           } else {
             console.error(msg);
-            if (advancedReject) console.error(`[IBKR] advancedOrderRejectJson: ${advancedReject}`);
           }
 
-          if (reqId > 0) {
+          if (isRelevantRequestId(reqId)) {
             const existingOrderResult = this.orderResults.get(reqId);
             this.orderResults.set(reqId, {
               orderId: reqId,
@@ -191,11 +358,9 @@ class IBKRClient {
               code,
               errorMessage,
               rejectReason: msg,
-              advancedOrderRejectJson: advancedReject,
             });
           }
 
-          // Reject pending request if applicable
           const pending = this.pendingRequests.get(reqId);
           if (pending) {
             clearTimeout(pending.timeout);
@@ -204,32 +369,47 @@ class IBKRClient {
               reqId,
               errorMessage,
               rejectReason: msg,
-              advancedOrderRejectJson: advancedReject,
             });
             pending.reject(enrichedError);
             this.pendingRequests.delete(reqId);
           }
         });
 
+        client.on(EventName.marketDataType, (reqId: number, marketDataType: number) => {
+          if (this.ib !== client) return;
+          const mode = normalizeMarketDataMode(marketDataType);
+          if (mode !== "unknown") {
+            this.latestMarketDataMode = mode;
+          }
+          const ticker = this.tickerReqMap.get(reqId);
+          if (ticker && mode !== "unknown") {
+            this.tickerFeedModes.set(ticker, mode);
+          }
+          console.log(`[IBKR] marketDataType event: reqId=${reqId}, type=${marketDataType}, mode=${mode}`);
+        });
+
         // Next valid order ID
-        this.ib.on(EventName.nextValidId, (orderId: number) => {
+        client.on(EventName.nextValidId, (orderId: number) => {
+          if (this.ib !== client) return;
           this.nextOrderId = orderId;
           console.log(`[IBKR] Next valid order ID: ${orderId}`);
         });
 
         // Managed accounts
-        this.ib.on(EventName.managedAccounts, (accountsList: string) => {
+        client.on(EventName.managedAccounts, (accountsList: string) => {
+          if (this.ib !== client) return;
           this.accountId = accountsList.split(",")[0]?.trim() || "";
           console.log(`[IBKR] Account ID: ${this.accountId}`);
         });
 
         // Current time
-        this.ib.on(EventName.currentTime, (time: number) => {
+        client.on(EventName.currentTime, (time: number) => {
+          if (this.ib !== client) return;
           console.log(`[IBKR] Server time: ${new Date(time * 1000).toISOString()}`);
         });
 
         // Tick price data
-        this.ib.on(EventName.tickPrice, (reqId: number, tickType: number, price: number) => {
+        client.on(EventName.tickPrice, (reqId: number, tickType: number, price: number) => {
           const ticker = this.tickerReqMap.get(reqId);
           if (!ticker || price <= 0) return;
 
@@ -286,14 +466,14 @@ class IBKRClient {
         });
 
         // Tick size data (volume)
-        this.ib.on(EventName.tickSize, (reqId: number, tickType: number, size: number) => {
+        client.on(EventName.tickSize, (reqId: number, tickType: number, size: number) => {
+          if (this.ib !== client) return;
           const ticker = this.tickerReqMap.get(reqId);
           if (!ticker) return;
 
           const existing = this.stockPrices.get(ticker);
           if (!existing) return;
 
-          // tickType: 8=volume
           if (tickType === 8) {
             existing.volume = size;
             existing.timestamp = Date.now();
@@ -302,17 +482,19 @@ class IBKRClient {
         });
 
         // Option computation (greeks)
-        this.ib.on(EventName.tickOptionComputation, (reqId: number, tickType: number, tickAttrib: number, impliedVol: number, delta: number, optPrice: number, pvDividend: number, gamma: number, vega: number, theta: number) => {
+        client.on(EventName.tickOptionComputation, (reqId: number, tickType: number, impliedVol: number, delta: number, optPrice: number, pvDividend: number, gamma: number, vega: number, theta: number) => {
+          if (this.ib !== client) return;
           const pending = this.pendingRequests.get(reqId);
-          if (pending && tickType === 13) { // 13 = model option computation
+          if (pending && tickType === 13) {
             clearTimeout(pending.timeout);
-            pending.resolve({ iv: impliedVol, delta, gamma, vega, theta, optPrice });
+            pending.resolve({ iv: impliedVol, delta, gamma, vega, theta, optPrice, pvDividend });
             this.pendingRequests.delete(reqId);
           }
         });
 
         // Order status
-        this.ib.on(EventName.orderStatus, (orderId: number, status: string, filled: number, remaining: number, avgFillPrice: number, permId: number, parentId: number, lastFillPrice: number) => {
+        client.on(EventName.orderStatus, (orderId: number, status: string, filled: number, remaining: number, avgFillPrice: number, permId: number, parentId: number, lastFillPrice: number) => {
+          if (this.ib !== client) return;
           const existingOrderResult = this.orderResults.get(orderId);
           this.orderResults.set(orderId, {
             ...existingOrderResult,
@@ -336,16 +518,17 @@ class IBKRClient {
         });
 
         // Contract details response
-        this.ib.on(EventName.contractDetails, (reqId: number, contractDetails: any) => {
+        client.on(EventName.contractDetails, (reqId: number, contractDetails: any) => {
+          if (this.ib !== client) return;
           const pending = this.pendingRequests.get(reqId);
           if (pending) {
-            // Accumulate contract details
             if (!pending.resolve._data) pending.resolve._data = [];
             pending.resolve._data.push(contractDetails);
           }
         });
 
-        this.ib.on(EventName.contractDetailsEnd, (reqId: number) => {
+        client.on(EventName.contractDetailsEnd, (reqId: number) => {
+          if (this.ib !== client) return;
           const pending = this.pendingRequests.get(reqId);
           if (pending) {
             clearTimeout(pending.timeout);
@@ -355,7 +538,8 @@ class IBKRClient {
         });
 
         // Security definition option parameters
-        this.ib.on(EventName.securityDefinitionOptionParameter, (reqId: number, exchange: string, underlyingConId: number, tradingClass: string, multiplier: string, expirations: string[], strikes: number[]) => {
+        client.on(EventName.securityDefinitionOptionParameter, (reqId: number, exchange: string, underlyingConId: number, tradingClass: string, multiplier: string, expirations: string[], strikes: number[]) => {
+          if (this.ib !== client) return;
           const pending = this.pendingRequests.get(reqId);
           if (pending) {
             if (!pending.resolve._data) pending.resolve._data = [];
@@ -363,7 +547,8 @@ class IBKRClient {
           }
         });
 
-        this.ib.on(EventName.securityDefinitionOptionParameterEnd, (reqId: number) => {
+        client.on(EventName.securityDefinitionOptionParameterEnd, (reqId: number) => {
+          if (this.ib !== client) return;
           const pending = this.pendingRequests.get(reqId);
           if (pending) {
             clearTimeout(pending.timeout);
@@ -373,30 +558,28 @@ class IBKRClient {
         });
 
         // Connect
-        this.ib.connect();
+        client.connect();
 
         // Timeout
-        setTimeout(() => {
-          if (!this.connected) {
-            console.error("[IBKR] Connection timeout after 15s");
-            this.connecting = false;
-            resolve(false);
-          }
+        this.connectTimeout = setTimeout(() => {
+          if (this.ib !== client || this.connected) return;
+          console.error("[IBKR] Connection timeout after 15s");
+          this.cleanupConnectionState({ disconnectSocket: true });
+          finalize(false);
         }, 15000);
 
       } catch (err: any) {
         console.error(`[IBKR] Connection error: ${err.message}`);
-        this.connecting = false;
-        resolve(false);
+        this.cleanupConnectionState({ disconnectSocket: true });
+        finalize(false);
       }
     });
+
+    return this.connectPromise;
   }
 
   disconnect() {
-    if (this.ib) {
-      this.ib.disconnect();
-      this.connected = false;
-    }
+    this.cleanupConnectionState({ disconnectSocket: true });
   }
 
   isConnected(): boolean {
@@ -432,6 +615,12 @@ class IBKRClient {
       contract.secType = SecType.IND;
       contract.exchange = "CBOE";
     }
+    // For VIX index
+    if (ticker === "VIX") {
+      contract.symbol = "VIX";
+      contract.secType = SecType.IND;
+      contract.exchange = "CBOE";
+    }
 
     this.ib.reqMktData(reqId, contract, "", false, false);
     console.log(`[IBKR] Subscribed to ${ticker} market data (reqId: ${reqId})`);
@@ -443,6 +632,7 @@ class IBKRClient {
 
   private buildMesFutureContract(tastytradeSymbol: string = IBKR_MES_SYMBOL): Contract {
     const parsed = parseMesTastytradeSymbol(tastytradeSymbol);
+    const localSymbol = `${parsed.symbol}${parsed.monthCode}${String(parsed.year % 10)}`;
     return {
       symbol: parsed.symbol,
       secType: SecType.FUT,
@@ -450,6 +640,7 @@ class IBKRClient {
       currency: "USD",
       tradingClass: parsed.symbol,
       lastTradeDateOrContractMonth: `${parsed.year}${parsed.contractMonth}`,
+      localSymbol,
     };
   }
 
@@ -514,7 +705,7 @@ class IBKRClient {
       this.pendingRequests.set(reqId, {
         resolve: (details: any[]) => {
           const items = Array.isArray(details) ? details : [];
-          const conId = items[0]?.contract?.conId || null;
+          const conId = extractConIdFromContractDetails(items[0]);
           if (conId && conId > 0) {
             this.underlyingConIds.set(underlying, conId);
             resolve(conId);
@@ -776,14 +967,18 @@ class IBKRClient {
     expiry: string,
     quantity: number,
     entryLimitPrice: number,
-    stopLossPrice: number
+    stopLossPrice: number,
+    targetPrice?: number                      // Task B: optional 3-leg bracket
   ): Promise<IBKROrderResult | null> {
     if (!this.connected || !this.ib) return null;
 
+    const useTarget = typeof targetPrice === "number" && isFinite(targetPrice) && targetPrice > 0;
     const parentOrderId = this.nextOrderId++;
+    const targetOrderId = useTarget ? this.nextOrderId++ : undefined;
     const stopOrderId = this.nextOrderId++;
     const contract = this.buildOptionContract(underlying, type, strike, expiry);
 
+    // Parent BUY LMT — staged, will transmit with the LAST child.
     const parentOrder: Order = {
       action: "BUY" as OrderAction,
       totalQuantity: quantity,
@@ -793,6 +988,19 @@ class IBKRClient {
       transmit: false,
     };
 
+    // Target child SELL LMT (only when useTarget). transmit=false so stop leg below
+    // is the one that finalises the 3-leg transmission.
+    const targetOrder: Order | null = useTarget ? {
+      action: "SELL" as OrderAction,
+      totalQuantity: quantity,
+      orderType: OrderType.LMT,
+      lmtPrice: targetPrice!,
+      tif: "GTC",
+      parentId: parentOrderId,
+      transmit: false,
+    } : null;
+
+    // Stop child SELL STP — LAST child, transmit=true triggers full send.
     const stopOrder: Order = {
       action: "SELL" as OrderAction,
       totalQuantity: quantity,
@@ -807,28 +1015,35 @@ class IBKRClient {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(parentOrderId);
         const parentResult = this.orderResults.get(parentOrderId);
-        const childResult = this.orderResults.get(stopOrderId);
+        const stopResult = this.orderResults.get(stopOrderId);
+        const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
         resolve(parentResult ? {
           ...parentResult,
           stopOrderId,
+          targetOrderId,
           parentStatus: parentResult.parentStatus || parentResult.status,
-          childStopStatus: childResult?.status || parentResult.childStopStatus,
+          childStopStatus: stopResult?.status || parentResult.childStopStatus,
+          childTargetStatus: targetResult?.status,
         } : null);
       }, 30000);
 
       this.pendingRequests.set(parentOrderId, {
         resolve: (result: IBKROrderResult) => {
-          const childResult = this.orderResults.get(stopOrderId);
+          const stopResult = this.orderResults.get(stopOrderId);
+          const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
           resolve({
             ...result,
             stopOrderId,
+            targetOrderId,
             parentStatus: result.parentStatus || result.status,
-            childStopStatus: childResult?.status || result.childStopStatus,
+            childStopStatus: stopResult?.status || result.childStopStatus,
+            childTargetStatus: targetResult?.status,
           });
         },
         reject: (err: Error & { code?: number; errorMessage?: string; rejectReason?: string; advancedOrderRejectJson?: string }) => {
           const parentResult = this.orderResults.get(parentOrderId);
-          const childResult = this.orderResults.get(stopOrderId);
+          const stopResult = this.orderResults.get(stopOrderId);
+          const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
           resolve({
             orderId: parentOrderId,
             status: parentResult?.status || "Rejected",
@@ -837,9 +1052,11 @@ class IBKRClient {
             avgFillPrice: parentResult?.avgFillPrice || 0,
             lastFillPrice: parentResult?.lastFillPrice || 0,
             stopOrderId,
+            targetOrderId,
             permId: parentResult?.permId,
             parentStatus: parentResult?.parentStatus || parentResult?.status || "Rejected",
-            childStopStatus: childResult?.status || parentResult?.childStopStatus,
+            childStopStatus: stopResult?.status || parentResult?.childStopStatus,
+            childTargetStatus: targetResult?.status,
             code: err?.code,
             errorMessage: err?.errorMessage || err?.message || String(err),
             rejectReason: err?.rejectReason || err?.message || String(err),
@@ -849,17 +1066,26 @@ class IBKRClient {
         timeout,
       });
 
-      console.log(`[IBKR] Placing BRACKET order ${parentOrderId}/${stopOrderId}: BUY ${quantity} ${underlying} ${type.toUpperCase()} ${strike} ${expiry} @ ${entryLimitPrice} | STOP ${stopLossPrice}`);
+      const legsLog = useTarget
+        ? `BRACKET3 ${parentOrderId}/${targetOrderId}/${stopOrderId}: BUY ${quantity} ${underlying} ${type.toUpperCase()} ${strike} ${expiry} @ ${entryLimitPrice} | TARGET ${targetPrice} | STOP ${stopLossPrice}`
+        : `BRACKET2 ${parentOrderId}/${stopOrderId}: BUY ${quantity} ${underlying} ${type.toUpperCase()} ${strike} ${expiry} @ ${entryLimitPrice} | STOP ${stopLossPrice}`;
+      console.log(`[IBKR] Placing ${legsLog}`);
       this.ib!.placeOrder(parentOrderId, contract, parentOrder);
+      if (targetOrder && targetOrderId !== undefined) {
+        this.ib!.placeOrder(targetOrderId, contract, targetOrder);
+      }
       this.ib!.placeOrder(stopOrderId, contract, stopOrder);
     }).then((result) => {
       if (!result) return null;
-      const childResult = this.orderResults.get(stopOrderId);
+      const stopResult = this.orderResults.get(stopOrderId);
+      const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
       return {
         ...result,
         stopOrderId,
+        targetOrderId,
         parentStatus: result.parentStatus || result.status,
-        childStopStatus: childResult?.status || result.childStopStatus,
+        childStopStatus: stopResult?.status || result.childStopStatus,
+        childTargetStatus: targetResult?.status,
       };
     });
   }
@@ -867,6 +1093,51 @@ class IBKRClient {
   async cancelOrder(orderId: number): Promise<void> {
     if (!this.connected || !this.ib) return;
     this.ib.cancelOrder(orderId);
+  }
+
+  // ============================================================
+  // TASK C: modifyStopOrder — tighten / move an existing STP child
+  // ------------------------------------------------------------
+  // Limitation: this wrapper cannot guarantee IBKR-side "modify" semantics
+  // without knowing the exact contract + parentId + original tif used when
+  // the stop was first placed. We therefore only invoke placeOrder with the
+  // SAME orderId (IB TWS API convention for modify) and rely on the state
+  // machine to reflect the change. If the underlying ib client rejects this
+  // pattern we return a PENDING_MODIFY_STOP_REPLACE_AUDIT status rather than
+  // invent a cancel+replace path.
+  // ============================================================
+  async modifyStopOrder(
+    stopOrderId: number,
+    newStopPrice: number,
+    parentOrderId: number,
+    contract: Contract,
+    quantity: number
+  ): Promise<{ ok: boolean; status: string; detail: string }> {
+    if (!this.connected || !this.ib) {
+      return { ok: false, status: "NOT_CONNECTED", detail: "IBKR not connected" };
+    }
+    if (typeof stopOrderId !== "number" || !isFinite(stopOrderId)) {
+      return { ok: false, status: "BAD_STOP_ID", detail: `stopOrderId=${stopOrderId}` };
+    }
+    if (!isFinite(newStopPrice) || newStopPrice <= 0) {
+      return { ok: false, status: "BAD_PRICE", detail: `newStopPrice=${newStopPrice}` };
+    }
+    try {
+      const modified: Order = {
+        action: "SELL" as OrderAction,
+        totalQuantity: quantity,
+        orderType: OrderType.STP,
+        auxPrice: newStopPrice,
+        tif: "GTC",
+        parentId: parentOrderId,
+        transmit: true,
+      };
+      this.ib.placeOrder(stopOrderId, contract, modified);
+      console.log(`[IBKR] modifyStopOrder id=${stopOrderId} newStop=${newStopPrice} parent=${parentOrderId}`);
+      return { ok: true, status: "MODIFY_SUBMITTED", detail: `id=${stopOrderId} price=${newStopPrice}` };
+    } catch (e: any) {
+      return { ok: false, status: "PENDING_MODIFY_STOP_REPLACE_AUDIT", detail: e?.message || String(e) };
+    }
   }
 
   // ======== HISTORICAL DATA ========
@@ -880,9 +1151,10 @@ class IBKRClient {
     if (!this.connected || !this.ib) return [];
 
     const reqId = this.getNextReqId();
+    const isMesHistorical = ticker === "MES" || ticker === IBKR_MES_SYMBOL || String(ticker).startsWith("/MES");
 
     const contract: Contract = (() => {
-      if (ticker === "MES" || ticker === IBKR_MES_SYMBOL || String(ticker).startsWith("/MES")) {
+      if (isMesHistorical) {
         return this.buildMesFutureContract(ticker === "MES" ? IBKR_MES_SYMBOL : ticker);
       }
       const base: Contract = {
@@ -913,34 +1185,34 @@ class IBKRClient {
         resolve(bars);
       }, 30000);
 
-      // Listen for historical data
-      const onHistData = (rId: number, bar: any) => {
-        if (rId !== reqId) return;
-        if (bar && bar.close !== undefined) {
-          bars.push({
-            time: typeof bar.time === 'string' ? new Date(bar.time).getTime() / 1000 : bar.time,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            close: bar.close,
-            volume: bar.volume || 0,
-          });
-        }
-      };
-
-      const onHistEnd = (rId: number) => {
-        if (rId !== reqId) return;
+      const finalizeHistorical = () => {
         clearTimeout(timeout);
         this.pendingRequests.delete(reqId);
-        // Remove listeners
-        this.ib!.off(EventName.historicalData, onHistData);
-        this.ib!.off(EventName.historicalDataEnd, onHistEnd);
+        removeListenerSafe(this.ib, EventName.historicalData, onHistData);
         console.log(`[IBKR] Historical data for ${ticker}: ${bars.length} bars`);
         resolve(bars);
       };
 
+      // Listen for historical data
+      const onHistData = (rId: number, date: unknown, open: number, high: number, low: number, close: number, volume: number) => {
+        if (rId !== reqId) return;
+        if (isHistoricalDataFinishedMarker(date)) {
+          finalizeHistorical();
+          return;
+        }
+        if (close !== undefined) {
+          bars.push({
+            time: parseHistoricalDateToEpochSeconds(date),
+            open,
+            high,
+            low,
+            close,
+            volume: volume || 0,
+          });
+        }
+      };
+
       this.ib!.on(EventName.historicalData, onHistData);
-      this.ib!.on(EventName.historicalDataEnd, onHistEnd);
 
       this.pendingRequests.set(reqId, {
         resolve: () => {},
@@ -950,14 +1222,15 @@ class IBKRClient {
 
       // Request historical data
       // Empty endDateTime = current time
+      const useRTH = isMesHistorical ? 0 : 1;
       this.ib!.reqHistoricalData(
         reqId,
         contract,
         "", // endDateTime - empty = now
         duration, // durationStr
-        barSize, // barSizeSetting
-        whatToShow as WhatToShow, // whatToShow
-        1, // useRTH (1 = regular trading hours only)
+        barSize,
+        whatToShow,
+        useRTH,
         1, // formatDate
         false // keepUpToDate
       );
