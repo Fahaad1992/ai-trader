@@ -1507,7 +1507,9 @@ export class TradingEngine {
       : `$${S.toFixed(2)} vs VWAP:$${data.vwap.toFixed(2)}`;
 
     return [
-      { name: "trend", label: "الاتجاه (EMA 9/21)", passed: trendUp, value: trendUp ? `صاعد ↑ (${data.ema9} > ${data.ema21})` : `هابط ↓ (${data.ema9} < ${data.ema21})` },
+      // BIDIRECTIONAL TREND (DRY_RUN supports SHORT). Trend "passes" for a clean up OR down trend.
+      // Direction is preserved in value (صاعد/هابط) and is later used to derive optionSide/tradeSide.
+      { name: "trend", label: "الاتجاه (EMA 9/21)", passed: data.ema9 !== data.ema21, value: trendUp ? `صاعد ↑ (${data.ema9} > ${data.ema21})` : `هابط ↓ (${data.ema9} < ${data.ema21})` },
       { name: "rsi", label: "RSI (14)", passed: rsiPassed, value: rsiTag },
       { name: "macd", label: "إشارة MACD", passed: trendUp ? macdHist > 0 : macdHist < 0, value: `Hist:${macdHist > 0 ? '+' : ''}${macdHist.toFixed(3)} Line:${data.macdLine.toFixed(3)}` },
       { name: "adx", label: "قوة ADX", passed: adx > 20, value: `${adx.toFixed(1)} [من شموع حقيقية]` },
