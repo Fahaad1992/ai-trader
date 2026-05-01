@@ -65,6 +65,16 @@ export interface Trade {
   openedAt: number;
   closedAt?: number;
   closeReason?: CloseReason;
+  // ---- BE-stop / re-entry policy (futures-aware) ----
+  initialStopPrice?: number;
+  breakEvenTriggerPrice?: number;
+  breakEvenStopMoved?: boolean;
+  breakEvenMovedAt?: number;
+  effectiveStopPrice?: number;
+  exitReason?: "FIXED_STOP_LOSS" | "BREAK_EVEN_STOP" | "TAKE_PROFIT" | "MANUAL_EXIT" | "TRAILING_STOP" | "UNKNOWN";
+  reEntryAllowed?: boolean;
+  ibkrStopOrderId?: number;
+  ibkrStopPermId?: number;
   status: "open" | "closed";
   dataSource: "real-data-paper" | "polygon" | "ibkr-live" | "ibkr-paper";
 }

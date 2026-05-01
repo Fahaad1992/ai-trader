@@ -1111,6 +1111,60 @@ class IBKRClient {
     });
   }
 
+  /**
+   * Modify a working futures STP order in-place (same orderId).
+   * IBKR/CME accepts re-issuing placeOrder with the existing orderId
+   * to update auxPrice. Returns true on Submitted/PreSubmitted ACK.
+   */
+  async modifyFuturesStopPrice(
+    stopOrderId: number,
+    symbol: string,
+    contractMonth: string,
+    side: "LONG" | "SHORT",
+    quantity: number,
+    newAuxPrice: number,
+  ): Promise<{ ok: boolean; status: string; permId?: number; reason?: string }> {
+    if (!this.connected || !this.ib) return { ok: false, status: "not_connected", reason: "ibkr_not_connected" };
+    if (!stopOrderId || stopOrderId <= 0) return { ok: false, status: "bad_id", reason: "missing_stopOrderId" };
+    if (!/^[0-9]{6}$/.test(String(contractMonth || ""))) return { ok: false, status: "bad_month", reason: "invalid_contractMonth" };
+    if (!(quantity > 0) || !(newAuxPrice > 0)) return { ok: false, status: "bad_args", reason: "bad_qty_or_price" };
+    const contract = this.buildFuturesContract(symbol, contractMonth);
+    if (contract.secType !== SecType.FUT || contract.exchange !== "CME") {
+      return { ok: false, status: "bad_contract", reason: "contract_sanity_failed" };
+    }
+    const action: OrderAction = (side === "LONG" ? "SELL" : "BUY") as OrderAction;
+    const order: Order = {
+      action,
+      totalQuantity: quantity,
+      orderType: OrderType.STP,
+      auxPrice: newAuxPrice,
+      tif: "GTC",
+      transmit: true,
+    };
+    return await new Promise((resolve) => {
+      const done = (res: any) => { try { resolve(res); } catch {} };
+      const t = setTimeout(() => done({ ok: false, status: "timeout", reason: "modify_ack_timeout" }), 8000);
+      try {
+        this.pendingRequests.set(stopOrderId, {
+          resolve: (r: IBKROrderResult) => {
+            clearTimeout(t);
+            const st = String(r?.status || "").toLowerCase();
+            const ok = ["submitted", "presubmitted", "accepted"].some(s => st.includes(s));
+            done({ ok, status: r?.status || "unknown", permId: r?.permId });
+          },
+          reject: (e: any) => {
+            clearTimeout(t);
+            done({ ok: false, status: e?.status || "rejected", reason: e?.errorMessage || e?.message || "modify_rejected" });
+          },
+        });
+        this.ib!.placeOrder(stopOrderId, contract, order);
+      } catch (e: any) {
+        clearTimeout(t);
+        done({ ok: false, status: "exception", reason: e?.message || String(e) });
+      }
+    });
+  }
+
   async placeBracketOrder(
     underlying: string,
     type: "call" | "put",

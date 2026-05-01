@@ -352,7 +352,15 @@ export function notifyTradeExit(
   pnlPercent: number,
   exitPrice: number,
   entryTime: number,
-  exitTime: number = Date.now()
+  exitTime: number = Date.now(),
+  opts?: {
+    exitReasonKey?: string;
+    breakEvenStopMoved?: boolean;
+    reEntryAllowed?: boolean;
+    blockedReason?: string | null;
+    initialStopPrice?: number;
+    effectiveStopPrice?: number;
+  }
 ): void {
   // FUTURES-AWARE: in futures mode, symbol already encodes "MES FUT 202606".
   // For options, keep legacy "<sym> <expiry> <strike> CALL/PUT".
@@ -374,8 +382,13 @@ export function notifyTradeExit(
 ⏰ مدة الصفقة: ${duration}
 💵 سعر الخروج: $${exitPrice.toFixed(2)}
 ${pnlColor} النتيجة: <b>$${pnl.toFixed(2)}</b> (${pnlPercent.toFixed(1)}%)`;
-  const exitSummary = `contract=${contract} reason=${normalizedReason} pnl=$${pnl.toFixed(2)} pnlPct=${pnlPercent.toFixed(1)} exit=$${exitPrice.toFixed(2)}`;
-  send(eventType, msg, exitSummary);
+  const beLine = opts?.exitReasonKey
+    ? `\n🏷️ تصنيف الخروج: <b>${opts.exitReasonKey}</b>${opts.breakEvenStopMoved ? ' (BE-moved)' : ''}${typeof opts.reEntryAllowed === 'boolean' ? ` | re-entry:${opts.reEntryAllowed ? 'allowed' : 'blocked'}` : ''}${opts.blockedReason ? ` | blocked:${opts.blockedReason}` : ''}`
+    : '';
+  const finalMsg = msg + beLine;
+  const beSummary = opts?.exitReasonKey ? ` exitReason=${opts.exitReasonKey} beMoved=${!!opts.breakEvenStopMoved} reEntry=${opts.reEntryAllowed ?? 'n/a'} blocked=${opts.blockedReason ?? 'none'} initStop=${opts.initialStopPrice ?? 'n/a'} effStop=${opts.effectiveStopPrice ?? 'n/a'}` : '';
+  const exitSummary = `contract=${contract} reason=${normalizedReason} pnl=$${pnl.toFixed(2)} pnlPct=${pnlPercent.toFixed(1)} exit=$${exitPrice.toFixed(2)}${beSummary}`;
+  send(eventType, finalMsg, exitSummary);
 }
 
 export function notifyStopLossHit(symbol: string, pnl: number): void {

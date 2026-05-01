@@ -400,6 +400,9 @@ export class TradingEngine {
   private brokerAccountSnapshot: BrokerAccountSnapshot | null = null;
   private brokerAccountPollTimer: ReturnType<typeof setInterval> | null = null;
   private ibkrStopOrderIds = new Map<string, number>();
+  private lastExitReason: string | null = null;
+  private lastExitPnl: number = 0;
+  private reEntryBlockedReason: string | null = null;
   private scanIdx = 0;
   private dataState: "idle" | "waiting" | "connected" | "failed" = "idle";
   private dataRetryCount = 0;
@@ -1115,7 +1118,8 @@ export class TradingEngine {
 
       if (this.getOpenTrades().length >= this.config.risk.maxOpenPositions) return;
       if (this.getTodayTrades().length >= this.getEffectiveMaxTradesPerDay()) return;
-      if (this.lastTradeTime && Date.now() - this.lastTradeTime < this.config.risk.cooldownMinutes * 60000) return;
+      // BE-policy cooldown: only after FIXED_STOP_LOSS with negative PnL.
+      if (this.lastTradeTime && this.lastExitReason === 'FIXED_STOP_LOSS' && (this.lastExitPnl ?? 0) < 0 && Date.now() - this.lastTradeTime < this.config.risk.cooldownMinutes * 60000) return;
 
       const isAggressive = this.config.activeStrategy === 'zeroHero';
       const minRequired = isAggressive ? 4 : 5;
@@ -2423,9 +2427,61 @@ export class TradingEngine {
         const side: "LONG" | "SHORT" = (t.tradeSide === "SHORT") ? "SHORT" : "LONG";
         const stops = calculateMesStops(t.entryPremium, side);
         const px = t.currentPremium;
+        // ====== BREAK-EVEN STOP MOVE (Live-ready, DRY_RUN safe) ======
+        try {
+          if (!t.initialStopPrice) t.initialStopPrice = stops.stopPrice;
+          if (!t.effectiveStopPrice) t.effectiveStopPrice = stops.stopPrice;
+          if (!t.breakEvenTriggerPrice) {
+            t.breakEvenTriggerPrice = side === 'LONG'
+              ? t.entryPremium + 6
+              : t.entryPremium - 6;
+          }
+          const triggered = side === 'LONG'
+            ? px >= (t.breakEvenTriggerPrice ?? Infinity)
+            : px <= (t.breakEvenTriggerPrice ?? -Infinity);
+          if (triggered && !t.breakEvenStopMoved) {
+            const newStopPrice = side === 'LONG' ? t.entryPremium + 1 : t.entryPremium - 1;
+            const oldStopPrice = t.effectiveStopPrice ?? t.initialStopPrice ?? stops.stopPrice;
+            const isLive = !this.isDryRunActive(); // exists; otherwise always false in DRY_RUN
+            if (isLive && t.ibkrStopOrderId) {
+              const ack = await ibkr.modifyFuturesStopPrice(
+                t.ibkrStopOrderId, 'MES', '202606', side, t.quantity, newStopPrice,
+              );
+              if (ack.ok) {
+                t.effectiveStopPrice = newStopPrice;
+                t.breakEvenStopMoved = true;
+                t.breakEvenMovedAt = Date.now();
+                if (ack.permId) t.ibkrStopPermId = ack.permId;
+                this.log('info', `[BE_STOP_MOVED_LIVE] ${t.underlying} ${side} entry:$${t.entryPremium} oldStop:$${oldStopPrice} newStop:$${newStopPrice} stopOrderId:${t.ibkrStopOrderId} permId:${t.ibkrStopPermId ?? 'n/a'} status:${ack.status}`, {
+                  tradeId: t.id, oldStopPrice, newStopPrice, stopOrderId: t.ibkrStopOrderId,
+                  permId: t.ibkrStopPermId, modifyAckStatus: ack.status, breakEvenMovedAt: t.breakEvenMovedAt,
+                });
+              } else {
+                this.reEntryBlockedReason = 'IBKR_STOP_MODIFY_FAILED';
+                this.log('error', `[BE_STOP_MODIFY_FAILED] ${t.underlying} ${side} reason:${ack.reason} status:${ack.status} stopOrderId:${t.ibkrStopOrderId}`, {
+                  tradeId: t.id, oldStopPrice, newStopPrice, stopOrderId: t.ibkrStopOrderId,
+                  modifyAckStatus: ack.status, reason: ack.reason,
+                });
+                try { notify(`🚨 CRITICAL: IBKR stop modify failed (${ack.reason || ack.status}). Trades blocked.`); } catch {}
+              }
+            } else {
+              // DRY_RUN path: internal-only stop
+              t.effectiveStopPrice = newStopPrice;
+              t.breakEvenStopMoved = true;
+              t.breakEvenMovedAt = Date.now();
+              this.log('info', `[BE_STOP_DRY_RUN] ${t.underlying} ${side} entry:$${t.entryPremium} px:$${px} oldStop:$${oldStopPrice} newStop:$${newStopPrice}`, {
+                tradeId: t.id, oldStopPrice, newStopPrice, breakEvenTriggerPrice: t.breakEvenTriggerPrice,
+                breakEvenMovedAt: t.breakEvenMovedAt, modifyAckStatus: 'DRY_RUN',
+              });
+            }
+          }
+        } catch (_e) {}
+        // Use effectiveStopPrice (BE-aware) instead of initial stops.stopPrice
+        const effectiveStop = t.effectiveStopPrice ?? stops.stopPrice;
+
         if (side === "LONG") {
-          if (px <= stops.stopPrice) {
-            this.log("info", `[FUT_CLOSE_SL] ${t.underlying} LONG | entry:$${t.entryPremium} | px:$${px} | stop:$${stops.stopPrice}`);
+          if (px <= effectiveStop) {
+            this.log("info", `[FUT_CLOSE_SL] ${t.underlying} LONG | entry:$${t.entryPremium} | px:$${px} | stop:$${effectiveStop}`);
             await this.closeTrade(t, "stop-loss");
             continue;
           }
@@ -2435,8 +2491,8 @@ export class TradingEngine {
             continue;
           }
         } else {
-          if (px >= stops.stopPrice) {
-            this.log("info", `[FUT_CLOSE_SL] ${t.underlying} SHORT | entry:$${t.entryPremium} | px:$${px} | stop:$${stops.stopPrice}`);
+          if (px >= effectiveStop) {
+            this.log("info", `[FUT_CLOSE_SL] ${t.underlying} SHORT | entry:$${t.entryPremium} | px:$${px} | stop:$${effectiveStop}`);
             await this.closeTrade(t, "stop-loss");
             continue;
           }
@@ -2495,6 +2551,24 @@ export class TradingEngine {
       t.pnl = pnlF;
       t.pnlPercent = Math.round((pnlF / paperBudgetF) * 10000) / 100;
       t.status = "closed"; t.closedAt = Date.now(); t.closeReason = reason;
+      // Classify exitReason for BE-policy / re-entry decisions
+      try {
+        const isStop = (reason === 'stop-loss');
+        const isTrail = (reason === 'trailing-stop');
+        if (isStop && t.breakEvenStopMoved) t.exitReason = 'BREAK_EVEN_STOP';
+        else if (isStop) t.exitReason = 'FIXED_STOP_LOSS';
+        else if (isTrail) t.exitReason = (sideF === 'LONG' ? exitPx >= t.entryPremium : exitPx <= t.entryPremium) ? 'TAKE_PROFIT' : 'TRAILING_STOP';
+        else t.exitReason = 'UNKNOWN';
+        t.reEntryAllowed = !(t.exitReason === 'FIXED_STOP_LOSS' && t.pnl < 0) && !this.reEntryBlockedReason;
+        this.lastExitReason = t.exitReason || null;
+        this.lastExitPnl = t.pnl;
+        this.log('info', `[FUT_EXIT_CLASSIFIED] ${t.underlying} ${sideF} reason:${reason} → ${t.exitReason} pnl:$${t.pnl} reEntryAllowed:${t.reEntryAllowed} blockedReason:${this.reEntryBlockedReason ?? 'none'}`, {
+          tradeId: t.id, exitReason: t.exitReason, reEntryAllowed: t.reEntryAllowed,
+          breakEvenStopMoved: !!t.breakEvenStopMoved, blockedReason: this.reEntryBlockedReason,
+          oldStopPrice: t.initialStopPrice, newStopPrice: t.effectiveStopPrice,
+          breakEvenTriggerPrice: t.breakEvenTriggerPrice, breakEvenMovedAt: t.breakEvenMovedAt,
+        });
+      } catch {}
       if (t.pnl < 0) this.consecutiveLosses++; else this.consecutiveLosses = 0;
       try {
         dbCloseTrade({
@@ -2509,7 +2583,7 @@ export class TradingEngine {
       } catch (e: any) { console.error(`[DB] Failed to close trade: ${e.message}`); }
       this.log("trade", `${t.pnl >= 0 ? "🟢" : "🔴"} FUT_CLOSE ${sideF} ${t.underlying} entry:$${t.entryPremium} exit:$${exitPx} pts:${pointsF.toFixed(2)} pnl:$${t.pnl} (${t.pnlPercent >= 0 ? "+" : ""}${t.pnlPercent.toFixed(2)}%) reason:${reason}`, { tradeId: t.id });
       try {
-        notifyTradeExit(t.symbol, t.expiry || "", t.strike || 0, (sideF as any), reason ?? "unknown", t.pnl, t.pnlPercent, exitPx, t.openedAt, t.closedAt);
+        notifyTradeExit(t.symbol, t.expiry || "", t.strike || 0, (sideF as any), reason ?? "unknown", t.pnl, t.pnlPercent, exitPx, t.openedAt, t.closedAt, { exitReasonKey: t.exitReason, breakEvenStopMoved: !!t.breakEvenStopMoved, reEntryAllowed: t.reEntryAllowed, blockedReason: this.reEntryBlockedReason, initialStopPrice: t.initialStopPrice, effectiveStopPrice: t.effectiveStopPrice });
       } catch {}
       return;
     }
