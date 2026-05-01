@@ -354,7 +354,10 @@ export function notifyTradeExit(
   entryTime: number,
   exitTime: number = Date.now()
 ): void {
-  const contract = `${symbol} ${expiry} ${strike} ${formatOptionType(type)}`;
+  // FUTURES-AWARE: in futures mode, symbol already encodes "MES FUT 202606".
+  // For options, keep legacy "<sym> <expiry> <strike> CALL/PUT".
+  const _isFuturesSide = isFuturesSide(type);
+  const contract = _isFuturesSide ? symbol : `${symbol} ${expiry} ${strike} ${formatOptionType(type)}`;
   const pnlColor = pnl > 0 ? "🟢" : "🔴";
 
   const durationMs = exitTime - entryTime;
