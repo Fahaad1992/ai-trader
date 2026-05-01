@@ -75,6 +75,8 @@ export interface Trade {
   reEntryAllowed?: boolean;
   ibkrStopOrderId?: number;
   ibkrStopPermId?: number;
+  futuresSymbol?: string;
+  futuresContractMonth?: string;
   status: "open" | "closed";
   dataSource: "real-data-paper" | "polygon" | "ibkr-live" | "ibkr-paper";
 }

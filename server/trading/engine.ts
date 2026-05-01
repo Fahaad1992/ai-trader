@@ -403,6 +403,23 @@ export class TradingEngine {
   private lastExitReason: string | null = null;
   private lastExitPnl: number = 0;
   private reEntryBlockedReason: string | null = null;
+  private lastFuturesSymbol: string | null = null;
+  private lastFuturesContractMonth: string | null = null;
+  private lastOrderPermIds: Map<string, number> = new Map();
+  /**
+   * Real env-driven DRY_RUN gate.
+   * DRY_RUN active (returns true) if:
+   *   - process.env.DRY_RUN in {1,true,yes,on}
+   *   - process.env.BE_FORCE_DRY_RUN in {1,true,yes,on}
+   *   - or IBKR_MODE/TRADING_MODE/BOT_MODE not exactly 'live'
+   * Live BE-stop modify only runs when this returns false AND mode=='live'.
+   */
+  private isDryRunActive(): boolean {
+    const yes = (v?: string) => !!v && /^(1|true|yes|on)$/i.test(String(v).trim());
+    if (yes(process.env.DRY_RUN) || yes(process.env.BE_FORCE_DRY_RUN)) return true;
+    const tm = (process.env.IBKR_MODE || process.env.TRADING_MODE || process.env.BOT_MODE || '').toLowerCase().trim();
+    return tm !== 'live';
+  }
   private scanIdx = 0;
   private dataState: "idle" | "waiting" | "connected" | "failed" = "idle";
   private dataRetryCount = 0;
@@ -2050,6 +2067,8 @@ export class TradingEngine {
             ? Number((gate as any).targetPrice)
             : Math.round((limitPrice + (limitPrice - stopLossPrice)) * 100) / 100;
           this.log("info", `[FUT_ROUTE] symbol=${futSymbol} contractMonth=${futContractMonth} qty=${orderQuantity} entry=$${limitPrice} stop=$${stopLossPrice} target=$${targetForBracket} | secType=FUT exchange=CME multiplier=5`);
+          this.lastFuturesSymbol = futSymbol;
+          this.lastFuturesContractMonth = futContractMonth;
           result = await (ibkr as any).placeFuturesBracket(
             futSymbol,
             futContractMonth,
@@ -2058,6 +2077,7 @@ export class TradingEngine {
             stopLossPrice,
             targetForBracket,
           );
+          try { if (result && (result as any).orderId && (result as any).permId) this.lastOrderPermIds.set(String((result as any).orderId), (result as any).permId); } catch {}
         } else {
           result = await ibkr.placeBracketOrder(underlying, ct, opt.strike, opt.expiry, orderQuantity, limitPrice, stopLossPrice);
         }
@@ -2265,7 +2285,22 @@ export class TradingEngine {
     this.trades.push(t);
     if (ibkrOrderId !== undefined) {
       const stopOrderId = this.ibkrStopOrderIds.get(String(ibkrOrderId));
-      if (stopOrderId !== undefined) this.ibkrStopOrderIds.set(t.id, stopOrderId);
+      if (stopOrderId !== undefined) {
+        this.ibkrStopOrderIds.set(t.id, stopOrderId);
+        // Persist on Trade for BE-stop modify-in-place. Live-only meaning;
+        // in DRY_RUN this map is empty so no live id is set.
+        t.ibkrStopOrderId = stopOrderId;
+        try { (t as any).ibkrStopPermId = (this.lastOrderPermIds && this.lastOrderPermIds.get(String(ibkrOrderId))) || undefined; } catch {}
+        // Capture futures contract identity at order time.
+        if (isFuturesMode()) {
+          t.futuresSymbol = (this.lastFuturesSymbol || 'MES');
+          t.futuresContractMonth = (this.lastFuturesContractMonth || '');
+        }
+        this.log('info', `[FUTURES_STOP_ORDER_TRACKED] tradeId:${t.id} parentOrderId:${ibkrOrderId} stopOrderId:${stopOrderId} permId:${(t as any).ibkrStopPermId ?? 'n/a'} futSym:${t.futuresSymbol ?? 'n/a'} futMonth:${t.futuresContractMonth ?? 'n/a'}`, {
+          tradeId: t.id, parentOrderId: ibkrOrderId, stopOrderId, permId: (t as any).ibkrStopPermId ?? null,
+          futuresSymbol: t.futuresSymbol ?? null, futuresContractMonth: t.futuresContractMonth ?? null,
+        });
+      }
     }
     this.lastTradeTime = Date.now();
 
@@ -2445,7 +2480,12 @@ export class TradingEngine {
             const isLive = !this.isDryRunActive(); // exists; otherwise always false in DRY_RUN
             if (isLive && t.ibkrStopOrderId) {
               const ack = await ibkr.modifyFuturesStopPrice(
-                t.ibkrStopOrderId, 'MES', '202606', side, t.quantity, newStopPrice,
+                t.ibkrStopOrderId,
+                t.futuresSymbol || 'MES',
+                (t.futuresContractMonth || (t.expiry ? String(t.expiry).replace(/-/g, '').slice(0,6) : '')),
+                side,
+                t.quantity,
+                newStopPrice,
               );
               if (ack.ok) {
                 t.effectiveStopPrice = newStopPrice;
@@ -2462,7 +2502,7 @@ export class TradingEngine {
                   tradeId: t.id, oldStopPrice, newStopPrice, stopOrderId: t.ibkrStopOrderId,
                   modifyAckStatus: ack.status, reason: ack.reason,
                 });
-                try { notify(`🚨 CRITICAL: IBKR stop modify failed (${ack.reason || ack.status}). Trades blocked.`); } catch {}
+                try { notifyCriticalError('BE-stop modify failed', `IBKR stop modify failed (${ack.reason || ack.status}). Trades blocked.`); } catch {}
               }
             } else {
               // DRY_RUN path: internal-only stop
@@ -2475,7 +2515,16 @@ export class TradingEngine {
               });
             }
           }
-        } catch (_e) {}
+        } catch (e: any) {
+          // Hard guard: never swallow BE-stop errors.
+          const errMsg = (e && (e.message || e.stack)) ? (e.message || e.stack) : String(e);
+          this.reEntryBlockedReason = this.reEntryBlockedReason || 'BE_STOP_LOGIC_ERROR';
+          this.log('error', `[BE_STOP_LOGIC_ERROR] ${t.underlying} ${side} ${errMsg}`, {
+            tradeId: t.id, errorMessage: errMsg, blockedReason: this.reEntryBlockedReason,
+            stopOrderId: t.ibkrStopOrderId ?? null, permId: t.ibkrStopPermId ?? null,
+          });
+          try { notifyCriticalError('BE-stop logic error', `${errMsg}. Trades blocked.`); } catch {}
+        }
         // Use effectiveStopPrice (BE-aware) instead of initial stops.stopPrice
         const effectiveStop = t.effectiveStopPrice ?? stops.stopPrice;
 

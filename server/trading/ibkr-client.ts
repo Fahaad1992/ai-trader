@@ -1145,7 +1145,7 @@ class IBKRClient {
       const done = (res: any) => { try { resolve(res); } catch {} };
       const t = setTimeout(() => done({ ok: false, status: "timeout", reason: "modify_ack_timeout" }), 8000);
       try {
-        this.pendingRequests.set(stopOrderId, {
+        (this.pendingRequests as any).set(stopOrderId, {
           resolve: (r: IBKROrderResult) => {
             clearTimeout(t);
             const st = String(r?.status || "").toLowerCase();
