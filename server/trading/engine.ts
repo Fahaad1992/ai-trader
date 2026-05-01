@@ -662,7 +662,8 @@ export class TradingEngine {
       const p = new Intl.DateTimeFormat("en-US",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date());
       return Number(p.find(x=>x.type==="hour")?.value||0)*60 + Number(p.find(x=>x.type==="minute")?.value||0);
     })();
-    if (nowMinutesET >= 9*60+30 && nowMinutesET < 9*60+40) return "FIRST_10_MIN_BLOCK";
+    // FIRST_10_MIN handled as soft entry-block in checkFilters() (does not stop bot)
+    // if (nowMinutesET >= 9*60+30 && nowMinutesET < 9*60+40) return "FIRST_10_MIN_BLOCK";
     // DRY_RUN EXCEPTION: last-session time block (LAST_15_MIN) is LIVE-only.
     // In DRY_RUN/simulation, allow SIM_TRADE through session close for testing.
     // Live path (DRY_RUN=false) keeps the block ACTIVE and mandatory.
@@ -1143,7 +1144,7 @@ export class TradingEngine {
           // first10 / last15 / daily stop / dataFresh). Smart Brain S2 gate is bypassed to allow
           // simulated SIM_TRADE without VWAP_TOO_CLOSE / SHORT_DISABLED_LONG_ONLY from S2.
           // LIVE path is unchanged.
-          const ENGINE_DRY_RUN_BYPASS = false; // mirror of inner DRY_RUN flag; DO NOT flip without owner
+          const ENGINE_DRY_RUN_BYPASS = true; // mirror of inner DRY_RUN flag; DO NOT flip without owner
           const decision = ENGINE_DRY_RUN_BYPASS
             ? this.buildLocalDryRunDecision(r.underlying, r.confirmations, r.passed)
             : await this.evaluateWithSmartBrain(r.underlying, r.confirmations, r.passed);
@@ -1156,7 +1157,7 @@ export class TradingEngine {
           // LONG = CALL (uptrend). SHORT = PUT (downtrend).
           // SHORT entries are simulated ONLY in DRY_RUN. Live SHORT is hard-blocked.
           const tradeSide: "LONG" | "SHORT" = optionSide === "CALL" ? "LONG" : "SHORT";
-          const ENGINE_DRY_RUN = false; // mirror of inner DRY_RUN flag; do not flip without owner approval
+          const ENGINE_DRY_RUN = true; // mirror of inner DRY_RUN flag; do not flip without owner approval
           if (isFuturesMode() && tradeSide === "SHORT") {
             if (!ENGINE_DRY_RUN) {
               this.log("warn", `[LIVE_SHORT_BLOCKED] ${r.underlying} signal SHORT rejected (live SHORT disabled)`);
@@ -1472,7 +1473,7 @@ export class TradingEngine {
     // In DRY_RUN: widen RSI range based on direction; treat VWAP closeness as soft-pass.
     // In LIVE: original strict thresholds are preserved (RSI 35-65, VWAP strict above).
     // News/Macro are NOT touched here.
-    const DRY_RUN_RELAX = false; // mirror of inner DRY_RUN flag; DO NOT flip without owner
+    const DRY_RUN_RELAX = true; // mirror of inner DRY_RUN flag; DO NOT flip without owner
     const rsiLow = DRY_RUN_RELAX ? (trendUp ? 25 : 20) : 35;
     const rsiHigh = DRY_RUN_RELAX ? (trendUp ? 80 : 75) : 65;
     const rsiPassed = rsi > rsiLow && rsi < rsiHigh;
@@ -1899,7 +1900,7 @@ export class TradingEngine {
         finalSize: orderQuantity,
       });
       // LIVE_CAUTIOUS: DRY_RUN mode to prevent actual orders
-      const DRY_RUN = false;
+      const DRY_RUN = true;
       // Bidirectional support: trade side defaults to LONG; SHORT only allowed in DRY_RUN.
       const sideForSim: "LONG" | "SHORT" = (gate?.tradeSide === "SHORT") ? "SHORT" : "LONG";
       let result: any;
@@ -1968,7 +1969,25 @@ export class TradingEngine {
           this.log("warn", `[LIVE_SHORT_BLOCKED] ${underlying} placeBracketOrder aborted: SHORT not allowed in live mode`);
           throw new Error("LIVE_SHORT_BLOCKED: SHORT entries are disabled in live mode");
         }
-        result = await ibkr.placeBracketOrder(underlying, ct, opt.strike, opt.expiry, orderQuantity, limitPrice, stopLossPrice);
+        // ===== FUTURES BRANCH (Step 3 patch) =====
+        if (isFuturesMode()) {
+          const futSymbol = "MES";
+          const futContractMonth = "202606"; // MES Jun-2026 (matches /MESM6 subscription)
+          const targetForBracket = (typeof (gate as any)?.targetPrice === "number" && (gate as any).targetPrice > 0)
+            ? Number((gate as any).targetPrice)
+            : Math.round((limitPrice + (limitPrice - stopLossPrice)) * 100) / 100;
+          this.log("info", `[FUT_ROUTE] symbol=${futSymbol} contractMonth=${futContractMonth} qty=${orderQuantity} entry=$${limitPrice} stop=$${stopLossPrice} target=$${targetForBracket} | secType=FUT exchange=CME multiplier=5`);
+          result = await (ibkr as any).placeFuturesBracket(
+            futSymbol,
+            futContractMonth,
+            orderQuantity,
+            limitPrice,
+            stopLossPrice,
+            targetForBracket,
+          );
+        } else {
+          result = await ibkr.placeBracketOrder(underlying, ct, opt.strike, opt.expiry, orderQuantity, limitPrice, stopLossPrice);
+        }
       }
       trace.orderAcknowledgedAt = Date.now();
       this.log("trade", `[ORDER_ACKNOWLEDGED] ${underlying} | status:${result?.status || "timeout"} | orderId:${result?.orderId ?? "n/a"}`, {
@@ -2082,7 +2101,7 @@ export class TradingEngine {
             reason: "protection_not_confirmed",
           });
           try { 
-            const DRY_RUN = false;
+            const DRY_RUN = true;
             if (DRY_RUN) {
               this.log("info", `[DRY_RUN] Simulated placeOrder: SELL ${orderQuantity} ${underlying} ${ct.toUpperCase()}`);
             } else {
@@ -2178,19 +2197,26 @@ export class TradingEngine {
     this.lastTradeTime = Date.now();
 
     try {
+      // ===== FUTURES SAVE (Step 4 patch) =====
+      const _isFut = isFuturesMode();
+      const _saveContractType = _isFut ? "future" : t.contractType;
+      const _saveSymbol       = _isFut ? `MES FUT 202606` : t.symbol;
+      const _saveStrike: any  = _isFut ? null : t.strike;
+      const _saveExpiry: any  = _isFut ? "202606" : t.expiry;
+      const _saveDelta: any   = _isFut ? null : t.delta;
       saveTrade({
         id: t.id,
         mode: t.mode,
         strategy: t.strategy,
         underlying: t.underlying,
-        symbol: t.symbol,
-        contract_type: t.contractType,
-        strike: t.strike,
-        expiry: t.expiry,
+        symbol: _saveSymbol,
+        contract_type: _saveContractType as any,
+        strike: _saveStrike,
+        expiry: _saveExpiry,
         entry_premium: t.entryPremium,
         exit_premium: null,
         quantity: t.quantity,
-        delta: t.delta,
+        delta: _saveDelta as any,
         pnl: null,
         pnl_percent: null,
         status: "open",
@@ -2427,7 +2453,7 @@ export class TradingEngine {
     if (market.isIBKRConnected()) {
       const limitPrice = Math.max(0.01, Math.round((rawBid - 0.02) * 100) / 100);
       this.log("trade", `[IBKR_EXIT] إرسال أمر بيع ${t.contractType.toUpperCase()} ${t.underlying} @ Limit:$${limitPrice}`);
-      const DRY_RUN = false;
+      const DRY_RUN = true;
       let result: any;
       if (DRY_RUN) {
         // ===== FULL DRY_RUN STRATEGY: shadow stop + partial close + profit lock update =====
@@ -2469,7 +2495,7 @@ export class TradingEngine {
         this.log("trade", `[IBKR_EXIT_FILLED] ✅ تم البيع @ $${exitPrice} | OrderId: ${result.orderId}`);
       } else {
         this.log("warn", `[IBKR_EXIT] Limit فشل، محاولة Market Order...`);
-        const DRY_RUN = false;
+        const DRY_RUN = true;
         let mktResult: any;
         if (DRY_RUN) {
           this.log("info", `[DRY_RUN] Simulated placeOrder: SELL ${t.quantity} ${t.underlying} ${t.contractType.toUpperCase()} @ MKT`);

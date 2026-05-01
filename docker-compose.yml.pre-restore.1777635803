@@ -5,14 +5,14 @@ services:
     restart: always
     environment:
       TWS_USERID: opshxv419
-      TWS_PASSWORD: Ff@097531
+      TWS_PASSWORD: ${TWS_PASSWORD}
       TWOFA_DEVICE: ""
       TRADING_MODE: live
       READ_ONLY_API: "no"
       TWS_ACCEPT_INCOMING: accept
       TWOFA_TIMEOUT_ACTION: "exit"
       TIME_ZONE: Etc/UTC
-      VNC_SERVER_PASSWORD: 83e8092f36434a719938
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD}
       SAVE_TWS_SETTINGS: "yes"
     ports:
       - "127.0.0.1:4001:4003"

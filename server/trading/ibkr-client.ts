@@ -3,7 +3,7 @@
  * Uses @stoqey/ib library for real-time market data and order execution
  */
 import IB from "ib";
-import { assertOptionsRuntimeAllowed } from "./trade-mode.js";
+import { assertOptionsRuntimeAllowed, isFuturesMode } from "./trade-mode.js";
 
 type IBApi = any;
 type Contract = Record<string, any>;
@@ -862,6 +862,157 @@ class IBKRClient {
 
   // ======== ORDER EXECUTION ========
 
+  // ============================================================
+  // FUTURES PATH (MES) — added by fut4steps patch
+  // Contract: secType=FUT, exchange=CME, symbol=MES, currency=USD,
+  //           multiplier=5, lastTradeDateOrContractMonth=YYYYMM
+  // ============================================================
+  private buildFuturesContract(
+    symbol: string,
+    contractMonth: string,
+  ): Contract {
+    return {
+      symbol,
+      secType: SecType.FUT,
+      exchange: "CME",
+      currency: "USD",
+      lastTradeDateOrContractMonth: contractMonth,
+      multiplier: "5",
+    } as Contract;
+  }
+  /**
+   * Place a 3-leg bracket order on a CME futures contract (e.g. MES).
+   * - parent: BUY LMT @ entryLimitPrice (transmit=false)
+   * - target: SELL LMT @ targetPrice    (transmit=false, parentId=parent)
+   * - stop  : SELL STP @ stopLossPrice  (transmit=true,  parentId=parent)
+   *
+   * NOTE: This function NEVER builds or sends an option contract. It refuses to
+   * proceed if symbol is empty or contractMonth is malformed.
+   */
+  async placeFuturesBracket(
+    symbol: string,
+    contractMonth: string,
+    quantity: number,
+    entryLimitPrice: number,
+    stopLossPrice: number,
+    targetPrice?: number,
+  ): Promise<IBKROrderResult | null> {
+    if (!this.connected || !this.ib) return null;
+    if (!symbol || typeof symbol !== "string") {
+      console.warn("[FUT_BRACKET] aborted: missing symbol");
+      return null;
+    }
+    if (!/^[0-9]{6}$/.test(String(contractMonth || ""))) {
+      console.warn(`[FUT_BRACKET] aborted: invalid contractMonth=${contractMonth}`);
+      return null;
+    }
+    if (!(quantity > 0) || !(entryLimitPrice > 0) || !(stopLossPrice > 0)) {
+      console.warn(`[FUT_BRACKET] aborted: bad args qty=${quantity} entry=${entryLimitPrice} stop=${stopLossPrice}`);
+      return null;
+    }
+    const useTarget = typeof targetPrice === "number" && isFinite(targetPrice) && targetPrice > 0;
+    const parentOrderId = this.nextOrderId++;
+    const targetOrderId = useTarget ? this.nextOrderId++ : undefined;
+    const stopOrderId = this.nextOrderId++;
+    const contract = this.buildFuturesContract(symbol, contractMonth);
+    // Hard sanity check on built contract
+    if (contract.secType !== SecType.FUT || contract.exchange !== "CME" || contract.symbol !== symbol) {
+      console.warn(`[FUT_BRACKET] aborted: contract sanity failed ${JSON.stringify(contract)}`);
+      return null;
+    }
+    const parentOrder: Order = {
+      action: "BUY" as OrderAction,
+      totalQuantity: quantity,
+      orderType: OrderType.LMT,
+      lmtPrice: entryLimitPrice,
+      tif: "DAY",
+      transmit: false,
+    };
+    const targetOrder: Order | null = useTarget ? {
+      action: "SELL" as OrderAction,
+      totalQuantity: quantity,
+      orderType: OrderType.LMT,
+      lmtPrice: targetPrice!,
+      tif: "GTC",
+      parentId: parentOrderId,
+      transmit: false,
+    } : null;
+    const stopOrder: Order = {
+      action: "SELL" as OrderAction,
+      totalQuantity: quantity,
+      orderType: OrderType.STP,
+      auxPrice: stopLossPrice,
+      tif: "GTC",
+      parentId: parentOrderId,
+      transmit: true,
+    };
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(parentOrderId);
+        const parentResult = this.orderResults.get(parentOrderId);
+        const stopResult = this.orderResults.get(stopOrderId);
+        const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
+        resolve(parentResult ? {
+          ...parentResult,
+          stopOrderId,
+          targetOrderId,
+          parentStatus: parentResult.parentStatus || parentResult.status,
+          childStopStatus: stopResult?.status || parentResult.childStopStatus,
+          childTargetStatus: targetResult?.status,
+        } : null);
+      }, 30000);
+      this.pendingRequests.set(parentOrderId, {
+        resolve: (result: IBKROrderResult) => {
+          const stopResult = this.orderResults.get(stopOrderId);
+          const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
+          resolve({
+            ...result,
+            stopOrderId,
+            targetOrderId,
+            parentStatus: result.parentStatus || result.status,
+            childStopStatus: stopResult?.status || result.childStopStatus,
+            childTargetStatus: targetResult?.status,
+          });
+        },
+        reject: (err: Error & { code?: number; errorMessage?: string; rejectReason?: string; advancedOrderRejectJson?: string }) => {
+          const parentResult = this.orderResults.get(parentOrderId);
+          const stopResult = this.orderResults.get(stopOrderId);
+          const targetResult = targetOrderId !== undefined ? this.orderResults.get(targetOrderId) : undefined;
+          resolve({
+            orderId: parentOrderId,
+            status: parentResult?.status || "Rejected",
+            filled: parentResult?.filled || 0,
+            remaining: parentResult?.remaining ?? quantity,
+            avgFillPrice: parentResult?.avgFillPrice || 0,
+            lastFillPrice: parentResult?.lastFillPrice || 0,
+            stopOrderId,
+            targetOrderId,
+            permId: parentResult?.permId,
+            parentStatus: parentResult?.parentStatus || parentResult?.status || "Rejected",
+            childStopStatus: stopResult?.status || parentResult?.childStopStatus,
+            childTargetStatus: targetResult?.status,
+            code: err?.code,
+            errorMessage: err?.errorMessage || err?.message || String(err),
+            rejectReason: err?.rejectReason || err?.message || String(err),
+            advancedOrderRejectJson: err?.advancedOrderRejectJson,
+          } as IBKROrderResult);
+        },
+        timeout,
+      });
+      const legsLog = useTarget
+        ? `FUT_BRACKET3 ${parentOrderId}/${targetOrderId}/${stopOrderId}: BUY ${quantity} ${symbol} FUT ${contractMonth} @ ${entryLimitPrice} | TARGET ${targetPrice} | STOP ${stopLossPrice}`
+        : `FUT_BRACKET2 ${parentOrderId}/${stopOrderId}: BUY ${quantity} ${symbol} FUT ${contractMonth} @ ${entryLimitPrice} | STOP ${stopLossPrice}`;
+      console.log(`[IBKR] Placing ${legsLog}`);
+      this.ib!.placeOrder(parentOrderId, contract, parentOrder);
+      if (targetOrder && targetOrderId !== undefined) {
+        this.ib!.placeOrder(targetOrderId, contract, targetOrder);
+      }
+      this.ib!.placeOrder(stopOrderId, contract, stopOrder);
+    });
+  }
+  /**
+   * Build an option contract (SMART, OPT). KEPT for options mode.
+   */
   private buildOptionContract(
     underlying: string,
     type: "call" | "put",
@@ -970,6 +1121,21 @@ class IBKRClient {
     stopLossPrice: number,
     targetPrice?: number                      // Task B: optional 3-leg bracket
   ): Promise<IBKROrderResult | null> {
+    // STEP 2 GUARD: refuse OPT bracket while tradeMode=futures
+    if (isFuturesMode()) {
+      const msg = `[OPT_BLOCKED_IN_FUTURES] placeBracketOrder refused: tradeMode=futures, would send OPT contract`;
+      console.warn(msg);
+      return {
+        orderId: -1,
+        status: "Rejected",
+        filled: 0,
+        remaining: 0,
+        avgFillPrice: 0,
+        lastFillPrice: 0,
+        rejectReason: "OPT_BLOCKED_IN_FUTURES",
+        errorMessage: msg,
+      } as IBKROrderResult;
+    }
     if (!this.connected || !this.ib) return null;
 
     const useTarget = typeof targetPrice === "number" && isFinite(targetPrice) && targetPrice > 0;
