@@ -675,7 +675,7 @@ export class TradingEngine {
     const ibkrStatus = market.getIBKRStatus();
     if (!ibkrStatus.accountId) return "IBKR_ACCOUNT_UNAVAILABLE";
     // LIVE_CAUTIOUS: Lock to specific account
-    const REQUIRED_ACCOUNT_ID = "U17745834";
+    const REQUIRED_ACCOUNT_ID = process.env.IBKR_REQUIRED_ACCOUNT_ID || "";
     if (ibkrStatus.accountId !== REQUIRED_ACCOUNT_ID) return `WRONG_ACCOUNT:${ibkrStatus.accountId}`;
     // LIVE_CAUTIOUS: Time window guards (ET)
     const nowMinutesET = (() => {
@@ -1260,6 +1260,30 @@ export class TradingEngine {
           }
 
           try {
+            // ===== P0: post-FIXED_STOP_LOSS cooldown gate =====
+            try {
+              const _cooldownMs = 5 * 60_000;
+              const _closed = this.trades.filter((x: any) => x.status === 'closed');
+              const _last = _closed.length ? _closed[_closed.length - 1] : null;
+              if (_last) {
+                const _isLossSL = (_last.closeReason === 'stop-loss' || _last.exitReason === 'FIXED_STOP_LOSS')
+                  && (typeof _last.pnl === 'number' && _last.pnl < 0);
+                const _since = Date.now() - (_last.closedAt || 0);
+                if (_isLossSL && _since < _cooldownMs) {
+                  const _remaining = Math.max(0, _cooldownMs - _since);
+                  this.reEntryBlockedReason = 'POST_FIXED_STOP_COOLDOWN';
+                  this.log('warn', `[REENTRY_BLOCKED] ${r.underlying} POST_FIXED_STOP_COOLDOWN remainingMs:${_remaining} lastTradeId:${_last.id} lastPnl:$${_last.pnl}`,
+                    { tradeId: _last.id, lastExitReason: _last.exitReason ?? null, lastCloseReason: _last.closeReason ?? null,
+                      lastPnl: _last.pnl, sinceMs: _since, cooldownMs: _cooldownMs, remainingMs: _remaining,
+                      blockedReason: 'POST_FIXED_STOP_COOLDOWN', reEntryAllowed: false });
+                  try { notifyTradeRejected(r.underlying, `POST_FIXED_STOP_COOLDOWN remaining ${(Math.ceil(_remaining/1000))}s`); } catch {}
+                  return;
+                }
+              }
+            } catch (e: any) {
+              this.log('error', `[REENTRY_GATE_ERROR] ${e?.message || e}`);
+            }
+            // ===== END P0 cooldown gate =====
             // In futures mode the Telegram decision label must reflect LONG/SHORT (not CALL/PUT).
             const decisionOptionTypeLabel: any = isFuturesMode() ? tradeSide : optionSide;
             notifyDecision(
@@ -2333,6 +2357,24 @@ export class TradingEngine {
         opened_at: t.openedAt,
         closed_at: null,
         data_source: t.dataSource,
+        // === observability_v1 fields (NULL-safe; do not affect logic) ===
+        side: ((t as any).tradeSide ?? (_isFut ? "LONG" : (t.contractType === "call" ? "LONG" : "SHORT"))) as any,
+        mode_effective: (typeof (this as any).isDryRunActive === "function" && (this as any).isDryRunActive()) ? "DRY_RUN" : "LIVE",
+        trade_mode: (_isFut ? "futures" : "options") as any,
+        sec_type: (_isFut ? "FUT" : "OPT") as any,
+        contract_month: (_isFut ? ((t as any).futuresContractMonth ?? this.lastFuturesContractMonth ?? "202606") : null) as any,
+        stop_price: (typeof stopLossPrice === "number" ? stopLossPrice : ((t as any).initialStopPrice ?? null)) as any,
+        target_price: ((typeof (gate as any)?.targetPrice === "number" && (gate as any).targetPrice > 0) ? Number((gate as any).targetPrice) : (typeof targetForBracket !== "undefined" ? (targetForBracket as any) : null)) as any,
+        signal_id: ((gate as any)?.signalId ?? null) as any,
+        confidence: (typeof gate?.confidence === "number" ? gate.confidence : null) as any,
+        confirmations_passed: (Array.isArray(conf) ? conf.filter(c => c.passed).length : null) as any,
+        confirmations_total: (Array.isArray(conf) ? conf.length : null) as any,
+        order_sent_to_ibkr: ((typeof (this as any).isDryRunActive === "function" && (this as any).isDryRunActive()) ? 0 : (typeof ibkrOrderId === "number" ? 1 : 0)) as any,
+        ibkr_order_id: (typeof ibkrOrderId === "number" ? ibkrOrderId : null) as any,
+        perm_id: (() => { try { const pid = result && (result as any).permId; return typeof pid === "number" ? pid : null; } catch { return null; } })() as any,
+        slippage: (typeof slippage === "number" ? slippage : null) as any,
+        requested_size: (typeof requestedSize === "number" ? requestedSize : null) as any,
+        final_size: (typeof orderQuantity === "number" ? orderQuantity : null) as any,
       });
     } catch (e: any) {
       console.error(`[DB] Failed to save trade: ${e.message}`);
@@ -2606,7 +2648,9 @@ export class TradingEngine {
         const isTrail = (reason === 'trailing-stop');
         if (isStop && t.breakEvenStopMoved) t.exitReason = 'BREAK_EVEN_STOP';
         else if (isStop) t.exitReason = 'FIXED_STOP_LOSS';
-        else if (isTrail) t.exitReason = (sideF === 'LONG' ? exitPx >= t.entryPremium : exitPx <= t.entryPremium) ? 'TAKE_PROFIT' : 'TRAILING_STOP';
+        else if (isTrail) t.exitReason = 'TRAILING_STOP'; // P0: trailing must NOT be relabeled as TAKE_PROFIT
+        else if (reason === 'target' || reason === 'take-profit' || reason === 'TAKE_PROFIT') t.exitReason = 'TAKE_PROFIT';
+        else if (reason === 'manual' || reason === 'MANUAL_EXIT') t.exitReason = 'MANUAL_EXIT';
         else t.exitReason = 'UNKNOWN';
         t.reEntryAllowed = !(t.exitReason === 'FIXED_STOP_LOSS' && t.pnl < 0) && !this.reEntryBlockedReason;
         this.lastExitReason = t.exitReason || null;
@@ -2628,6 +2672,11 @@ export class TradingEngine {
           status: "closed",
           close_reason: reason ?? "unknown",
           closed_at: t.closedAt,
+          // === observability_v1 close fields ===
+          exit_reason: ((t as any).exitReason ?? null) as any,
+          points: (typeof pointsF === "number" ? pointsF : null) as any,
+          reentry_allowed: (typeof (t as any).reEntryAllowed === "boolean" ? ((t as any).reEntryAllowed ? 1 : 0) : null) as any,
+          blocked_reason: (this.reEntryBlockedReason ?? null) as any,
         });
       } catch (e: any) { console.error(`[DB] Failed to close trade: ${e.message}`); }
       this.log("trade", `${t.pnl >= 0 ? "🟢" : "🔴"} FUT_CLOSE ${sideF} ${t.underlying} entry:$${t.entryPremium} exit:$${exitPx} pts:${pointsF.toFixed(2)} pnl:$${t.pnl} (${t.pnlPercent >= 0 ? "+" : ""}${t.pnlPercent.toFixed(2)}%) reason:${reason}`, { tradeId: t.id });
@@ -2720,6 +2769,11 @@ export class TradingEngine {
         status: "closed",
         close_reason: reason ?? "unknown",
         closed_at: t.closedAt,
+        // === observability_v1 close fields ===
+        exit_reason: ((t as any).exitReason ?? null) as any,
+        reentry_allowed: (typeof (t as any).reEntryAllowed === "boolean" ? ((t as any).reEntryAllowed ? 1 : 0) : null) as any,
+        blocked_reason: (this.reEntryBlockedReason ?? null) as any,
+        slippage: (typeof exitSlippage === "number" ? exitSlippage : null) as any,
       });
     } catch (e: any) {
       console.error(`[DB] Failed to close trade: ${e.message}`);
@@ -2776,6 +2830,10 @@ export class TradingEngine {
         status: "closed",
         close_reason: "manual",
         closed_at: t.closedAt,
+        // === observability_v1 close fields ===
+        exit_reason: ((t as any).exitReason ?? "MANUAL_EXIT") as any,
+        reentry_allowed: (typeof (t as any).reEntryAllowed === "boolean" ? ((t as any).reEntryAllowed ? 1 : 0) : null) as any,
+        blocked_reason: (this.reEntryBlockedReason ?? null) as any,
       });
     } catch (e: any) {
       console.error(`[DB] Failed to close trade: ${e.message}`);

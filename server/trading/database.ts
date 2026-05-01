@@ -14,6 +14,45 @@ const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
 
+// === OBSERVABILITY_MIGRATION_v1 ===
+try {
+  const _existing = (db.prepare("PRAGMA table_info(trades)").all() as any[]).map(r => r.name);
+  const _adds: Array<[string, string]> = [
+    ["side",                   "TEXT"],
+    ["mode_effective",         "TEXT"],
+    ["trade_mode",             "TEXT"],
+    ["sec_type",               "TEXT"],
+    ["contract_month",         "TEXT"],
+    ["stop_price",             "REAL"],
+    ["target_price",           "REAL"],
+    ["signal_id",              "TEXT"],
+    ["confidence",             "REAL"],
+    ["confirmations_passed",   "INTEGER"],
+    ["confirmations_total",    "INTEGER"],
+    ["order_sent_to_ibkr",     "INTEGER"],
+    ["ibkr_order_id",          "INTEGER"],
+    ["perm_id",                "INTEGER"],
+    ["exit_reason",            "TEXT"],
+    ["points",                 "REAL"],
+    ["reentry_allowed",        "INTEGER"],
+    ["blocked_reason",         "TEXT"],
+    ["slippage",               "REAL"],
+    ["requested_size",         "INTEGER"],
+    ["final_size",             "INTEGER"],
+  ];
+  for (const [col, typ] of _adds) {
+    if (!_existing.includes(col)) {
+      db.exec(`ALTER TABLE trades ADD COLUMN ${col} ${typ}`);
+    }
+  }
+} catch (e) {
+  // Migration is best-effort; never crash boot.
+  // eslint-disable-next-line no-console
+  console.error("[DB_MIGRATE] observability_v1 failed:", (e as any)?.message || e);
+}
+// === /OBSERVABILITY_MIGRATION_v1 ===
+
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS trades (
   id TEXT PRIMARY KEY,
@@ -93,10 +132,20 @@ CREATE INDEX IF NOT EXISTS idx_tv_webhook_status ON tv_webhook_events(status);
 const insertTrade = db.prepare(`
   INSERT INTO trades (id, mode, strategy, underlying, symbol, contract_type, strike, expiry,
     entry_premium, exit_premium, quantity, delta, pnl, pnl_percent, status,
-    open_reason, close_reason, opened_at, closed_at, data_source)
+    open_reason, close_reason, opened_at, closed_at, data_source,
+    side, mode_effective, trade_mode, sec_type, contract_month,
+    stop_price, target_price, signal_id, confidence,
+    confirmations_passed, confirmations_total,
+    order_sent_to_ibkr, ibkr_order_id, perm_id,
+    slippage, requested_size, final_size)
   VALUES (@id, @mode, @strategy, @underlying, @symbol, @contract_type, @strike, @expiry,
     @entry_premium, @exit_premium, @quantity, @delta, @pnl, @pnl_percent, @status,
-    @open_reason, @close_reason, @opened_at, @closed_at, @data_source)
+    @open_reason, @close_reason, @opened_at, @closed_at, @data_source,
+    @side, @mode_effective, @trade_mode, @sec_type, @contract_month,
+    @stop_price, @target_price, @signal_id, @confidence,
+    @confirmations_passed, @confirmations_total,
+    @order_sent_to_ibkr, @ibkr_order_id, @perm_id,
+    @slippage, @requested_size, @final_size)
 `);
 
 const updateTradeClose = db.prepare(`
@@ -106,7 +155,12 @@ const updateTradeClose = db.prepare(`
     pnl_percent = @pnl_percent,
     status = @status,
     close_reason = @close_reason,
-    closed_at = @closed_at
+    closed_at = @closed_at,
+    exit_reason = COALESCE(@exit_reason, exit_reason),
+    points = COALESCE(@points, points),
+    reentry_allowed = COALESCE(@reentry_allowed, reentry_allowed),
+    blocked_reason = COALESCE(@blocked_reason, blocked_reason),
+    slippage = COALESCE(@slippage, slippage)
   WHERE id = @id
 `);
 
@@ -249,6 +303,24 @@ export function saveTrade(trade: {
   opened_at: number;
   closed_at: number | null;
   data_source: string;
+  // ---- observability fields (all optional, NULL-safe) ----
+  side?: string | null;
+  mode_effective?: string | null;
+  trade_mode?: string | null;
+  sec_type?: string | null;
+  contract_month?: string | null;
+  stop_price?: number | null;
+  target_price?: number | null;
+  signal_id?: string | null;
+  confidence?: number | null;
+  confirmations_passed?: number | null;
+  confirmations_total?: number | null;
+  order_sent_to_ibkr?: number | null;
+  ibkr_order_id?: number | null;
+  perm_id?: number | null;
+  slippage?: number | null;
+  requested_size?: number | null;
+  final_size?: number | null;
 }) {
   return insertTrade.run({
     ...trade,
@@ -257,6 +329,23 @@ export function saveTrade(trade: {
     pnl_percent: trade.pnl_percent ?? null,
     close_reason: trade.close_reason ?? null,
     closed_at: trade.closed_at ?? null,
+    side: (trade.side ?? null) as any,
+    mode_effective: (trade.mode_effective ?? null) as any,
+    trade_mode: (trade.trade_mode ?? null) as any,
+    sec_type: (trade.sec_type ?? null) as any,
+    contract_month: (trade.contract_month ?? null) as any,
+    stop_price: (trade.stop_price ?? null) as any,
+    target_price: (trade.target_price ?? null) as any,
+    signal_id: (trade.signal_id ?? null) as any,
+    confidence: (trade.confidence ?? null) as any,
+    confirmations_passed: (trade.confirmations_passed ?? null) as any,
+    confirmations_total: (trade.confirmations_total ?? null) as any,
+    order_sent_to_ibkr: (trade.order_sent_to_ibkr ?? null) as any,
+    ibkr_order_id: (trade.ibkr_order_id ?? null) as any,
+    perm_id: (trade.perm_id ?? null) as any,
+    slippage: (trade.slippage ?? null) as any,
+    requested_size: (trade.requested_size ?? null) as any,
+    final_size: (trade.final_size ?? null) as any,
   });
 }
 
@@ -268,8 +357,21 @@ export function closeTrade(update: {
   status: string;
   close_reason: string;
   closed_at: number;
+  // ---- observability fields (all optional) ----
+  exit_reason?: string | null;
+  points?: number | null;
+  reentry_allowed?: number | null;
+  blocked_reason?: string | null;
+  slippage?: number | null;
 }) {
-  return updateTradeClose.run(update);
+  return updateTradeClose.run({
+    ...update,
+    exit_reason: (update.exit_reason ?? null) as any,
+    points: (update.points ?? null) as any,
+    reentry_allowed: (update.reentry_allowed ?? null) as any,
+    blocked_reason: (update.blocked_reason ?? null) as any,
+    slippage: (update.slippage ?? null) as any,
+  });
 }
 
 export function loadOpenTrades() {

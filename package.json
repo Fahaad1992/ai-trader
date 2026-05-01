@@ -7,7 +7,8 @@
     "dev": "tsx watch server/index.ts",
     "dev:vite": "vite",
     "build": "vite build --outDir dist/public && esbuild server/index.ts --bundle --platform=node --packages=external --format=esm --outfile=dist/index.js",
-    "start": "NODE_ENV=production node dist/index.js"
+    "start": "NODE_ENV=production node dist/index.js",
+    "report:trades:today": "tsx scripts/report-today.ts"
   },
   "dependencies": {
     "@radix-ui/react-avatar": "^1.1.3",

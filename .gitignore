@@ -1,17 +1,59 @@
+# --- secrets ---
+.env
+.env.*
+*.env
+*.env.bak*
+*.pem
+*.key
+*.crt
+id_rsa
+id_rsa.*
+
+# --- build / deps ---
 node_modules/
 dist/
+build/
+.vite/
+
+# --- runtime data ---
 data/*.db
-*.log
-*.bak*
-.env
-.env*
-_tmp_*
-phase2_db_rows.js
-LIVE_GO_NOGO.sh
-quarantine_*
-tmp_*
 data/*.db-shm
 data/*.db-wal
 data/*.db.bak*
-.env.*
+data/backups/
+
+# --- logs ---
+logs/
+*.log
+*.nohup
+manual_monitor_events.log
+
+# --- backups ---
+backups/
 *.bak
+*.bak.*
+*.backup
+*.pre-restore.*
+*.bak_*
+*.session_stability_*.bak
+
+# --- IBKR Gateway local copies ---
+ibkr-live-clean/
+ibkr-live-clean-c1/
+ibkr-live-clean-c2/
+quarantine_*/
+
+# --- temp / scratch ---
+_tmp_*
+tmp_*
+LIVE_GO_NOGO.sh
+phase2_db_rows.js
+
+# --- reports (per-run artifacts) ---
+reports/
+
+# --- editor / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

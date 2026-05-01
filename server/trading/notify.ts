@@ -259,6 +259,20 @@ export function notifyDecision(
 
   const reasonArabic = summarizeReasonArabic(decision, reasonCodes, summary, extras);
   const contracts = extras?.finalSize ?? extras?.requestedSize;
+  // ===== P0: suppress EXECUTE with incomplete fields =====
+  if (decision === 'EXECUTE') {
+    const _miss: string[] = [];
+    if (!extras?.contract) _miss.push('contract');
+    if (!(typeof extras?.entryPrice === 'number' && extras.entryPrice > 0)) _miss.push('entry');
+    if (!(typeof extras?.stopLoss === 'number' && extras.stopLoss > 0)) _miss.push('stopLoss');
+    if (!(typeof extras?.target === 'number' && extras.target > 0)) _miss.push('target');
+    if (!(typeof contracts === 'number' && contracts > 0)) _miss.push('qty');
+    if (_miss.length) {
+      console.warn(`[NOTIFY_SUPPRESSED] type:DECISION_INCOMPLETE symbol=${symbol} decision=EXECUTE missing=${_miss.join(',')} signal=${signal} confidence=${confidenceFinal}%`);
+      send('DECISION_BLOCKED', '', `symbol=${symbol} decision=EXECUTE blocked=incomplete_fields missing=${_miss.join(',')}`);
+      return;
+    }
+  }
   const msg = `${emoji} قرار الصفقة
 
 📌 الرمز: <b>${symbol}</b>
@@ -383,7 +397,7 @@ export function notifyTradeExit(
 💵 سعر الخروج: $${exitPrice.toFixed(2)}
 ${pnlColor} النتيجة: <b>$${pnl.toFixed(2)}</b> (${pnlPercent.toFixed(1)}%)`;
   const beLine = opts?.exitReasonKey
-    ? `\n🏷️ تصنيف الخروج: <b>${opts.exitReasonKey}</b>${opts.breakEvenStopMoved ? ' (BE-moved)' : ''}${typeof opts.reEntryAllowed === 'boolean' ? ` | re-entry:${opts.reEntryAllowed ? 'allowed' : 'blocked'}` : ''}${opts.blockedReason ? ` | blocked:${opts.blockedReason}` : ''}`
+    ? `\n🏷️ تصنيف الخروج: <b>${opts.exitReasonKey}</b>${(opts.breakEvenStopMoved && opts.exitReasonKey === 'BREAK_EVEN_STOP') ? ' (BE-moved)' : ''}${typeof opts.reEntryAllowed === 'boolean' ? ` | re-entry:${opts.reEntryAllowed ? 'allowed' : 'blocked'}` : ''}${opts.blockedReason ? ` | blocked:${opts.blockedReason}` : ''}`
     : '';
   const finalMsg = msg + beLine;
   const beSummary = opts?.exitReasonKey ? ` exitReason=${opts.exitReasonKey} beMoved=${!!opts.breakEvenStopMoved} reEntry=${opts.reEntryAllowed ?? 'n/a'} blocked=${opts.blockedReason ?? 'none'} initStop=${opts.initialStopPrice ?? 'n/a'} effStop=${opts.effectiveStopPrice ?? 'n/a'}` : '';
