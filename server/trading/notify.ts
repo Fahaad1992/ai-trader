@@ -313,9 +313,11 @@ export function notifyTradeEntry(
     reasonArabic?: string | null;
   },
 ): void {
-  // Futures-aware contract label: for MES LONG/SHORT show symbol+side only (no strike/expiry).
-  const contract = isFuturesSide(type)
-    ? `${symbol} ${formatOptionType(type)}`
+  // Futures-aware contract label: for MES LONG/SHORT show "MES FUT 202606" (no strike/expiry/right).
+  const _isFuturesSide = isFuturesSide(type);
+  const _futContractMonth = "202606";
+  const contract = _isFuturesSide
+    ? `${symbol} FUT ${_futContractMonth}`
     : `${symbol} ${expiry} ${strike} ${formatOptionType(type)}`;
   const finalContracts = context?.finalSize ?? contracts;
   const reasonArabic = context?.reasonArabic?.trim()

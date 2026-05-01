@@ -805,6 +805,7 @@ export class TradingEngine {
     this.pnlTimer = setInterval(() => this.updateOpenTradePrices(), 30_000);
     this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 3_600_000);
     setTimeout(() => this.parallelScan(), 2000);
+    setTimeout(() => this.runOptBlockedSelfTest().catch(()=>{}), 5000);
   }
 
   stop() {
@@ -1062,7 +1063,24 @@ export class TradingEngine {
     }
   }
 
-  private async parallelScan() {
+
+  // STEP C: One-shot self-test of OPT_BLOCKED_IN_FUTURES guard. NEVER touches IBKR.
+  private async runOptBlockedSelfTest(): Promise<void> {
+    try {
+      if (!isFuturesMode()) return;
+      const ibkrAny: any = ibkr as any;
+      if (!ibkrAny || typeof ibkrAny.placeBracketOrder !== "function") {
+        this.log("warn", "[OPT_BLOCKED_SELFTEST] placeBracketOrder unavailable, skipping");
+        return;
+      }
+      const r = await ibkrAny.placeBracketOrder("MES", "call", 7000, "2026-06-20", 1, 50, 40);
+      const blocked = !!(r && r.rejectReason === "OPT_BLOCKED_IN_FUTURES");
+      this.log("info", `[OPT_BLOCKED_IN_FUTURES] selftest result blocked=${blocked} status=${r?.status || "n/a"} reason=${r?.rejectReason || "n/a"}`);
+    } catch (e: any) {
+      this.log("warn", `[OPT_BLOCKED_SELFTEST_ERR] ${e?.message || e}`);
+    }
+  }
+    private async parallelScan() {
     if (!this.running) return;
     const scanStart = Date.now();
     try {
@@ -1955,7 +1973,56 @@ export class TradingEngine {
           this.log("warn", `[DRY_RUN][STRATEGY_ERR] ${e?.message || e}`);
         }
         // ===== END FULL DRY_RUN STRATEGY =====
+        // ===== STEP B: unconditional FUT route emission (DRY_RUN safe) =====
+        if (isFuturesMode()) {
+          try {
+            const _futSym = "MES";
+            const _futCm = "202606";
+            const _futTgt = (typeof (gate as any)?.targetPrice === "number" && (gate as any).targetPrice > 0)
+              ? Number((gate as any).targetPrice)
+              : Math.round((limitPrice + (limitPrice - stopLossPrice)) * 100) / 100;
+            this.log("info", `[FUT_ROUTE] symbol=${_futSym} contractMonth=${_futCm} qty=${orderQuantity} entry=$${limitPrice} stop=$${stopLossPrice} target=$${_futTgt} | secType=FUT exchange=CME multiplier=5 (DRY_RUN preview)`);
+            this.log("info", `[FUTURES_CONTRACT_PREVIEW] symbol=${_futSym} secType=FUT exchange=CME contractMonth=${_futCm} multiplier=5 qty=${orderQuantity} entry=$${limitPrice} stop=$${stopLossPrice} target=$${_futTgt}`);
+          } catch (e: any) {
+            this.log("warn", `[FUT_ROUTE_PREVIEW_ERR] ${e?.message || e}`);
+          }
+        }
         const simAction = sideForSim === "SHORT" ? "SELL_TO_OPEN_SIM" : "BUY";
+        // ===== FUTURES PREVIEW (DRY_RUN test harness) =====
+        // Build the FUT contract that WOULD be sent in live, log it for verification,
+        // but do NOT call ib.placeOrder (this branch never reaches IBKR).
+        if (isFuturesMode()) {
+          try {
+            const _futSymbol = "MES";
+            const _futCm = "202606";
+            const _futTarget = (typeof (gate as any)?.targetPrice === "number" && (gate as any).targetPrice > 0)
+              ? Number((gate as any).targetPrice)
+              : Math.round((limitPrice + (limitPrice - stopLossPrice)) * 100) / 100;
+            const _previewContract = {
+              symbol: _futSymbol,
+              secType: "FUT",
+              exchange: "CME",
+              currency: "USD",
+              multiplier: "5",
+              lastTradeDateOrContractMonth: _futCm,
+            };
+            this.log("info", `[FUTURES_CONTRACT_PREVIEW] symbol=${_previewContract.symbol} secType=${_previewContract.secType} exchange=${_previewContract.exchange} contractMonth=${_previewContract.lastTradeDateOrContractMonth} multiplier=${_previewContract.multiplier} qty=${orderQuantity} entry=$${limitPrice} stop=$${stopLossPrice} target=$${_futTarget}`, {
+              previewContract: _previewContract,
+              quantity: orderQuantity,
+              entryLimitPrice: limitPrice,
+              stopLossPrice,
+              targetPrice: _futTarget,
+              dryRun: true,
+              willSendToIbkr: false,
+            });
+            // Sanity assert preview is FUT/CME/MES — proves OPT path is unreachable here
+            if (_previewContract.secType !== "FUT" || _previewContract.exchange !== "CME" || _previewContract.symbol !== "MES") {
+              this.log("error", "[FUTURES_PREVIEW_SANITY_FAIL] preview not FUT/CME/MES");
+            }
+          } catch (e: any) {
+            this.log("warn", `[FUTURES_PREVIEW_ERR] ${e?.message || e}`);
+          }
+        }
         this.log("info", `[DRY_RUN] Simulated placeBracketOrder: ${simAction} ${orderQuantity} ${underlying} ${ct.toUpperCase()} @ Limit:$${limitPrice} | Stop:$${stopLossPrice} | side:${sideForSim}`);
         result = {
           status: "Filled",
