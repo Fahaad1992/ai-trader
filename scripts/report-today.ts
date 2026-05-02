@@ -219,8 +219,8 @@ async function main() {
   lines.push("| Metric | Value |");
   lines.push("|---|---:|");
   lines.push(`| Total trades | ${total} (open:${openCount}, closed:${closedCount}) |`);
-  lines.push(`| CALL/LONG count | ${longCount} |`);
-  lines.push(`| PUT/SHORT count | ${shortCount} |`);
+  lines.push(`| CALL count | ${longCount} |`);
+  lines.push(`| PUT count | ${shortCount} |`);
   lines.push(`| Side unknown | ${sideUnknownCount} |`);
   lines.push(`| Cleanup count | ${cleanupCount} |`);
   lines.push(`| Quantity max / any qty>1 | ${qtyMax} / ${anyQtyGt1 ? "YES" : "NO"} |`);
