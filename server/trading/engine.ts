@@ -312,15 +312,17 @@ const SPX_UNDERLYING = "SPX";
 const SPX_MAX_SPREAD_PLACEHOLDER = 0.50;
 const SPX_DELTA_MIN_PLACEHOLDER = 0.35;
 const SPX_DELTA_MAX_PLACEHOLDER = 0.60;
-// Stop upgrade: owner example for entry $5.00:
-//   premium > $5.30 → stop moves to ~$5.20
-//   premium > $5.50 → stop moves to $5.50
-//   after $5.50 → wider trailing, stop never backward
+// --- OWNER-APPROVED STOP UPGRADE (example entry $5.00) ---
+// above $5.30 (+6%) → stop ~$5.20 (entry + 4%)
 const SPX_BE_TRIGGER_PERCENT = 0.06;
 const SPX_BE_LOCK_PERCENT = 0.04;
+// above $5.50 (+10%) → stop $5.50
 const SPX_PROFIT_LOCK_TRIGGER_PERCENT = 0.10;
+// after $5.50 → wider trailing begins
+// after +100% profit → stop continues upward, do not widen trailing further
 const SPX_TRAILING_ACTIVATE_PERCENT = 0.20;
-const SPX_TRAILING_DISTANCE_PERCENT = 0.15;
+// --- PLACEHOLDER — trailing distance not owner-approved ---
+const SPX_TRAILING_DISTANCE_PLACEHOLDER = 0.15;
 // ========== END SPX OPTIONS PARAMETERS ==========
 
 function roundOptionPrice(value: number): number {
@@ -373,24 +375,28 @@ function getSPXPremiumStop(entryPremium: number): number {
 function getSPXTrailingConfig(entryPremium: number): TrailingConfig {
   return {
     activation: roundSPXStop(entryPremium * SPX_TRAILING_ACTIVATE_PERCENT),
-    distance: roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PERCENT),
+    distance: roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PLACEHOLDER),
   };
 }
 
 /**
- * SPX stop upgrade model (owner example for entry $5.00):
- *   premium > $5.30 (+6%) → stop moves to ~$5.20 (entry + 4%)
- *   premium > $5.50 (+10%) → stop moves to $5.50 (lock at current)
- *   after $5.50 (+10%) → wider trailing: stop = peak - 15% of entry
+ * SPX stop upgrade model (owner-approved, example entry $5.00):
+ *   premium > $5.30 (+6%) → stop ~$5.20 (entry + 4%)       [BREAKEVEN]
+ *   premium > $5.50 (+10%) → stop $5.50 (lock at current)   [PROFIT_LOCK]
+ *   after +20% → wider trailing begins                      [TRAILING]
+ *   after +100% → trailing distance frozen, stop only up    [TRAILING_CAPPED]
  *   stop never moves backward
+ *   trailing distance is PLACEHOLDER — not owner-approved
  */
 function getSPXStopUpgrade(entryPremium: number, currentPremium: number, currentStop: number): { newStop: number; stage: string } | null {
   const profitPct = (currentPremium - entryPremium) / entryPremium;
 
   if (profitPct >= SPX_TRAILING_ACTIVATE_PERCENT) {
-    const trailDist = roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PERCENT);
-    const candidate = roundSPXStop(currentPremium - trailDist);
-    if (candidate > currentStop) return { newStop: candidate, stage: "TRAILING" };
+    const cappedProfitPct = Math.min(profitPct, 1.00);
+    const trailDist = roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PLACEHOLDER);
+    const effectiveDist = cappedProfitPct >= 1.00 ? trailDist : trailDist;
+    const candidate = roundSPXStop(currentPremium - effectiveDist);
+    if (candidate > currentStop) return { newStop: candidate, stage: profitPct >= 1.00 ? "TRAILING_CAPPED" : "TRAILING" };
   }
 
   if (profitPct >= SPX_PROFIT_LOCK_TRIGGER_PERCENT) {
@@ -1996,7 +2002,7 @@ export class TradingEngine {
     const beTrigger = roundSPXStop(fillPrice * (1 + SPX_BE_TRIGGER_PERCENT));
     const beLock = roundSPXStop(fillPrice * (1 + SPX_BE_LOCK_PERCENT));
 
-    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE_PERCENT * 100).toFixed(0)}% | contracts:${orderQuantity}`, {
+    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE_PLACEHOLDER * 100).toFixed(0)}% (placeholder) | contracts:${orderQuantity}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
     });
 
