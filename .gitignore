@@ -2,6 +2,7 @@
 .env
 .env.*
 *.env
+!.env.example
 *.env.bak*
 *.pem
 *.key
@@ -30,6 +31,7 @@ manual_monitor_events.log
 
 # --- backups ---
 backups/
+backup_*/
 *.bak
 *.bak.*
 *.backup
