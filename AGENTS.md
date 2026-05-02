@@ -27,18 +27,20 @@ ai-trader is a TypeScript automated trading bot (Express backend + React/Vite fr
 
 ### SPX Options real-time data rule
 
-Owner decision: SPX Options scalping requires real-time or near real-time data only.
+Owner decision: SPX Options scalping requires real-time IBKR data only.
 
-- Never use 120 seconds or any arbitrary stale threshold as "fresh" for SPX.
-- Never call data fresh if it is delayed.
-- Trade entry must be blocked if quote freshness is not acceptable.
-- If data source is delayed, missing, or uncertain: block with `SPX_REALTIME_DATA_REQUIRED`.
-- Do not silently fall back to stale data.
+- **IBKR is the required primary data source for SPX.** No Polygon fallback for SPX trading decisions.
+- Quote freshness: `quoteAge > 2 seconds` → block with `SPX_QUOTE_STALE`. Preferred `< 1 second`.
+- Missing timestamp → block with `SPX_REALTIME_DATA_REQUIRED`.
+- Missing bid/ask → block with `SPX_PREMIUM_MISSING`.
+- Delayed data is rejected completely. No silent fallback.
+- Never use 120 seconds as "fresh" for SPX.
 - Do not silently use MES or index price as option premium.
-- Do not use delayed data to justify any SPX trade.
 - Telegram/frontend must show stale/delayed warnings clearly.
 - Reports must not present delayed data as current.
-- Before implementing any exact freshness threshold, ask owner for explicit approval.
+- Monitor only 3–5 near-ATM SPX contracts, not full chain scan.
+- Use `reqContractDetails` + `reqMktData` for selected contracts via IBKR.
+- IBKR disconnected or dataFarm disconnected → block all SPX trades.
 
 ### Testing
 
