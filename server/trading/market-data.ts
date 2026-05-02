@@ -436,7 +436,13 @@ export class MarketDataProvider {
     if (connected) {
       this.ibkrMode = true;
       console.log("[Market] IBKR connected! Using IBKR for stock candles/live prices and IBKR for execution.");
-      if (isFuturesMode()) {
+      if (isSPXOptionsMode()) {
+        await ibkr.subscribeStock("SPX");
+        await delay(500);
+        await ibkr.subscribeStock("VIX");
+        await delay(500);
+        console.log("[Market] SPX mode: subscribed to SPX + VIX only (no SPY/QQQ/MES)");
+      } else if (isFuturesMode()) {
         await ibkr.subscribeMesFuture(IBKR_FUTURES_SYMBOL);
         await delay(500);
         await ibkr.subscribeStock("VIX");
