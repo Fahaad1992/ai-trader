@@ -9,7 +9,7 @@ import { ibkr } from "./ibkr-client.js";
 import { saveTrade, closeTrade as dbCloseTrade, loadOpenTrades, loadAllTrades, saveLog, saveDailyStats, loadLogs, loadErrorLogs, loadLogsSince } from "./database.js";
 import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat } from "./notify.js";
-import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
+import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
 import { isProtectionReady, classifySilentFailure } from "./live-safety";
 import {
@@ -301,12 +301,36 @@ type AssetStopProfile = {
 const INDEX_STOP_UNDERLYINGS = new Set(["SPX", "NDX", "QQQ"]);
 const SINGLE_STOCK_STOP_UNDERLYINGS = new Set(["NVDA", "TSLA", "AMZN"]);
 
+// ========== SPX OPTIONS DRY_RUN PARAMETERS ==========
+const SPX_INITIAL_STOP_PERCENT = 0.25;
+const SPX_TARGET_PERCENT = 0.35;
+const SPX_TRAILING_ACTIVATE_PERCENT = 0.20;
+const SPX_TRAILING_DISTANCE_PERCENT = 0.12;
+const SPX_BREAKEVEN_TRIGGER_PERCENT = 0.15;
+const SPX_BREAKEVEN_LOCK_PERCENT = 0.03;
+const SPX_MAX_CONTRACTS = 1;
+const SPX_MAX_PREMIUM = 25.00;
+const SPX_MAX_SPREAD = 0.50;
+const SPX_DELTA_MIN = 0.35;
+const SPX_DELTA_MAX = 0.60;
+const SPX_UNDERLYING = "SPX";
+// ========== END SPX OPTIONS PARAMETERS ==========
+
 function roundOptionPrice(value: number): number {
   return Math.max(0.01, Math.round(value * 100) / 100);
 }
 
 function getAssetStopProfile(underlying: string): AssetStopProfile {
   const symbol = underlying.toUpperCase();
+  if (isSPXOptionsMode() && symbol === SPX_UNDERLYING) {
+    return {
+      assetType: "index",
+      initialStopDistance: 0,
+      trailingStopDistance: 0,
+      defaultContracts: SPX_MAX_CONTRACTS,
+      stopWidthReason: "spx_options_premium_percent",
+    };
+  }
   if (symbol === FUTURES_ASSET_TYPE || (isFuturesMode() && symbol.startsWith(FUTURES_ASSET_TYPE))) {
     return {
       assetType: "futures",
@@ -335,12 +359,33 @@ function getAssetStopProfile(underlying: string): AssetStopProfile {
   };
 }
 
+function getSPXPremiumStop(entryPremium: number): number {
+  return roundOptionPrice(entryPremium * (1 - SPX_INITIAL_STOP_PERCENT));
+}
+
+function getSPXPremiumTarget(entryPremium: number): number {
+  return roundOptionPrice(entryPremium * (1 + SPX_TARGET_PERCENT));
+}
+
+function getSPXTrailingConfig(entryPremium: number): TrailingConfig {
+  return {
+    activation: roundOptionPrice(entryPremium * SPX_TRAILING_ACTIVATE_PERCENT),
+    distance: roundOptionPrice(entryPremium * SPX_TRAILING_DISTANCE_PERCENT),
+  };
+}
+
 export function getTrailingConfig(underlying: string, _entryPremium?: number): TrailingConfig {
+  if (isSPXOptionsMode() && underlying.toUpperCase() === SPX_UNDERLYING && _entryPremium && _entryPremium > 0) {
+    return getSPXTrailingConfig(_entryPremium);
+  }
   const profile = getAssetStopProfile(underlying);
   return { activation: PAPER_TRAILING_ACTIVATION_PROFIT, distance: profile.trailingStopDistance };
 }
 
 function getInitialStopPrice(entryPrice: number, underlying: string): number {
+  if (isSPXOptionsMode() && underlying.toUpperCase() === SPX_UNDERLYING) {
+    return getSPXPremiumStop(entryPrice);
+  }
   return roundOptionPrice(entryPrice - getAssetStopProfile(underlying).initialStopDistance);
 }
 // ========== END PAPER TRAILING STOP SETTINGS ==========
@@ -552,6 +597,7 @@ export class TradingEngine {
   }
 
   private getSignalUniverse(): string[] {
+    if (isSPXOptionsMode()) return [SPX_UNDERLYING];
     return isFuturesMode() ? [FUTURES_ASSET_TYPE] : UNDERLYINGS;
   }
 
@@ -1306,6 +1352,34 @@ export class TradingEngine {
           }
 
           if (decision.decision === "EXECUTE" || decision.decision === "REDUCE") {
+            // ===== SPX OPTIONS PATH =====
+            if (isSPXOptionsMode()) {
+              const spxValidated = await this.validateSPXOptionForEntry(r.confirmations);
+              if (spxValidated) {
+                executionTrace.marketDataReceivedAt = Date.now();
+                executionTrace.contractSelectedAt = Date.now();
+                this.log("info", `[SPX_CONTRACT_SELECTED] ${spxValidated.ticker} | strike:$${spxValidated.strike} | expiry:${spxValidated.expiry} | bid:$${spxValidated.bid} | ask:$${spxValidated.ask}`);
+                await this.openSPXTrade(r.confirmations, spxValidated, {
+                  signal: decision.signal,
+                  decision: decision.decision,
+                  reason: decision.summary,
+                  confidence: decision.confidence_final,
+                  rawScore: decision.confidence_score ?? null,
+                  latencyMs: decision.latency_ms ?? null,
+                  reasonCodes: decision.reason_codes,
+                  requestedSize,
+                  finalSize,
+                  finalSizeReason: decision.decision === "REDUCE" ? "smart_brain_reduce" : "threshold_execute",
+                  tradeSide: "LONG",
+                }, executionTrace);
+                break;
+              }
+              this.logDecisionAudit(r.underlying, "BLOCK", "spx_contract_data_unavailable_or_rejected", "none", {
+                signalScore: decision.signal, confidence: decision.confidence_final,
+              });
+              continue;
+            }
+            // ===== END SPX OPTIONS PATH =====
             const validated = await this.validateOptionForEntry(r.underlying, r.confirmations);
             if (validated) {
               this.logDecisionAudit(r.underlying, "EXECUTE", undefined, validated.source, {
@@ -1793,6 +1867,187 @@ export class TradingEngine {
     });
     return opt;
   }
+
+  // ========== SPX OPTIONS DRY_RUN ENTRY VALIDATION ==========
+  private async validateSPXOptionForEntry(conf: Confirmation[]): Promise<OptionQuote | null> {
+    const underlying = SPX_UNDERLYING;
+    const trendConf = conf.find(c => c.name === "trend");
+    const ct: "call" | "put" = trendConf?.value?.includes("صاعد") ? "call" : "put";
+
+    this.log("info", `[SPX_OPTION_VALIDATE] جاري البحث عن ${ct.toUpperCase()} لـ ${underlying} | Delta:${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | MaxPremium:$${SPX_MAX_PREMIUM} | MaxSpread:$${SPX_MAX_SPREAD}`, {
+      symbol: underlying, underlying, optionSide: ct.toUpperCase(),
+    });
+
+    let opt: OptionQuote | null = null;
+    try {
+      opt = await market.findOption(
+        underlying, ct,
+        [SPX_DELTA_MIN, SPX_DELTA_MAX],
+        [0.50, SPX_MAX_PREMIUM],
+        1
+      );
+    } catch (e: any) {
+      return this.rejectOptionQuality(underlying, ct, null, `SPX option lookup failed — ${e.message}`, "spx_contract_lookup_failed");
+    }
+
+    if (!opt) {
+      return this.rejectOptionQuality(underlying, ct, null, `لا يوجد عقد SPX بـ Delta ${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | Premium $0.50-$${SPX_MAX_PREMIUM}`, "spx_contract_not_found");
+    }
+
+    if (!opt.ticker || !opt.expiry || !(opt.strike > 0)) {
+      return this.rejectOptionQuality(underlying, ct, opt, "SPX_STRIKE_MISSING: contract data invalid", "spx_strike_missing");
+    }
+
+    if (!(opt.bid > 0) || !(opt.ask > 0)) {
+      return this.rejectOptionQuality(underlying, ct, opt, "SPX_PREMIUM_MISSING: bid/ask unavailable", "spx_premium_missing");
+    }
+
+    const premium = opt.ask;
+    if (premium > SPX_MAX_PREMIUM) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_MAX_PREMIUM_CAP: $${premium.toFixed(2)} > $${SPX_MAX_PREMIUM}`, "spx_max_premium_cap");
+    }
+
+    const spread = opt.ask - opt.bid;
+    if (spread > SPX_MAX_SPREAD) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_SPREAD_TOO_WIDE: $${spread.toFixed(2)} > $${SPX_MAX_SPREAD}`, "spx_spread_too_wide");
+    }
+
+    const absDelta = Math.abs(opt.delta);
+    if (!Number.isFinite(absDelta) || absDelta < SPX_DELTA_MIN || absDelta > SPX_DELTA_MAX) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_DELTA_OUT_OF_RANGE: ${absDelta.toFixed(3)} outside ${SPX_DELTA_MIN}-${SPX_DELTA_MAX}`, "spx_delta_out_of_range");
+    }
+
+    const dataAge = Date.now() - (opt.timestamp || 0);
+    if (dataAge > 120_000) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_DATA_STALE: data age ${Math.round(dataAge / 1000)}s > 120s`, "spx_data_stale");
+    }
+
+    const spreadPct = opt.mid > 0 ? (spread / opt.mid) * 100 : 999;
+    this.log("info", `[SPX_OPTION_ACCEPTED] ✅ ${opt.ticker} | ${ct.toUpperCase()} | Δ${absDelta.toFixed(3)} | Bid:$${opt.bid} Ask:$${opt.ask} Spread:$${spread.toFixed(2)} (${spreadPct.toFixed(1)}%) | IV:${(opt.iv * 100).toFixed(0)}% | Vol:${opt.volume} OI:${opt.openInterest}`, {
+      symbol: underlying, underlying, optionSide: ct.toUpperCase(),
+      bid: opt.bid, ask: opt.ask, premium: opt.ask,
+      contractDetails: this.formatContractDetails(opt, this.config.activeStrategy as Strategy),
+    });
+    return opt;
+  }
+
+  // ========== SPX OPTIONS DRY_RUN TRADE OPEN ==========
+  private async openSPXTrade(conf: Confirmation[], opt: OptionQuote, gate?: SmartBrainGate, executionTrace?: ExecutionTrace) {
+    const underlying = SPX_UNDERLYING;
+    const s = this.config.activeStrategy as Strategy;
+    const trendConf = conf.find(c => c.name === "trend");
+    const ct: ContractType = trendConf?.value?.includes("صاعد") ? "call" : "put";
+    const signal = `${underlying}:${conf.filter(c => c.passed).length}/8`;
+    const trace: ExecutionTrace = executionTrace ?? { signalDetectedAt: Date.now() };
+
+    if (!gate || (gate.decision !== "EXECUTE" && gate.decision !== "REDUCE")) {
+      this.log("error", `[SPX_SMART_BRAIN_BLOCK] signal:${signal} | decision:${gate?.decision || "BYPASSED"}`, {
+        symbol: underlying, underlying, optionSide: ct.toUpperCase(),
+      });
+      return;
+    }
+
+    if (this.getOpenTrades().length > 0) {
+      this.log("warn", `[SPX_SINGLE_POSITION] blocked: open trades exist (${this.getOpenTrades().length})`);
+      return;
+    }
+
+    const orderQuantity = Math.min(gate.finalSize ?? 1, SPX_MAX_CONTRACTS);
+    if (orderQuantity < 1) {
+      this.log("warn", `[SPX_POSITION_SIZE_BLOCK] final size < 1`);
+      return;
+    }
+
+    const fillPrice = opt.ask;
+    const stopPremium = getSPXPremiumStop(fillPrice);
+    const targetPremium = getSPXPremiumTarget(fillPrice);
+    const tConfig = getSPXTrailingConfig(fillPrice);
+    const breakEvenTrigger = roundOptionPrice(fillPrice * (1 + SPX_BREAKEVEN_TRIGGER_PERCENT));
+    const breakEvenLock = roundOptionPrice(fillPrice * (1 + SPX_BREAKEVEN_LOCK_PERCENT));
+
+    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | target:$${targetPremium.toFixed(2)} (+${(SPX_TARGET_PERCENT * 100).toFixed(0)}%) | trailing activate:$${tConfig.activation.toFixed(2)} distance:$${tConfig.distance.toFixed(2)} | BE trigger:$${breakEvenTrigger.toFixed(2)} lock:$${breakEvenLock.toFixed(2)} | contracts:${orderQuantity}`, {
+      symbol: underlying, underlying, optionSide: ct.toUpperCase(),
+    });
+
+    const spread = opt.ask - opt.bid;
+    const t: Trade = {
+      id: rid(), mode: this.config.mode, strategy: s, underlying,
+      symbol: `SPX ${opt.expiry} $${opt.strike}${ct === "call" ? "C" : "P"}`,
+      optionTicker: opt.ticker, contractType: ct,
+      strike: opt.strike, expiry: opt.expiry,
+      entryPremium: fillPrice, currentPremium: fillPrice,
+      quantity: orderQuantity,
+      delta: Math.abs(opt.delta), gamma: opt.gamma, theta: opt.theta, vega: opt.vega,
+      iv: opt.iv, volume: opt.volume, openInterest: opt.openInterest,
+      pnl: 0, pnlPercent: 0,
+      peakPrice: fillPrice,
+      trailingActive: false,
+      trailingStopPrice: stopPremium,
+      trailingConfig: tConfig,
+      initialStopPrice: stopPremium,
+      breakEvenTriggerPrice: breakEvenTrigger,
+      breakEvenStopMoved: false,
+      effectiveStopPrice: stopPremium,
+      openedAt: Date.now(), status: "open",
+      dataSource: "real-data-paper",
+    };
+
+    this.trades.push(t);
+    this.lastTradeTime = Date.now();
+
+    try {
+      saveTrade({
+        id: t.id, mode: t.mode, strategy: t.strategy, underlying: t.underlying,
+        symbol: t.symbol, contract_type: ct, strike: t.strike as any, expiry: t.expiry as any,
+        entry_premium: t.entryPremium, exit_premium: null, quantity: t.quantity,
+        delta: t.delta as any, pnl: null, pnl_percent: null, status: "open",
+        open_reason: `${conf.filter(c => c.passed).length}/8 confirmations`,
+        close_reason: null, opened_at: t.openedAt, closed_at: null,
+        data_source: t.dataSource,
+        side: "LONG" as any,
+        mode_effective: "DRY_RUN" as any,
+        trade_mode: "spx_options" as any,
+        sec_type: "OPT" as any,
+        contract_month: null as any,
+        stop_price: stopPremium as any,
+        target_price: targetPremium as any,
+        signal_id: ((gate as any)?.signalId ?? null) as any,
+        confidence: (gate?.confidence ?? null) as any,
+        confirmations_passed: conf.filter(c => c.passed).length as any,
+        confirmations_total: conf.length as any,
+        order_sent_to_ibkr: 0 as any,
+        ibkr_order_id: null as any,
+        perm_id: null as any,
+        slippage: 0 as any,
+        requested_size: (gate?.requestedSize ?? orderQuantity) as any,
+        final_size: orderQuantity as any,
+      });
+    } catch (e: any) {
+      console.error(`[SPX_DB] Failed to save trade: ${e.message}`);
+    }
+
+    try {
+      notifyTradeEntry(
+        underlying, opt.expiry, opt.strike, ct.toUpperCase(),
+        orderQuantity, fillPrice, stopPremium, targetPremium,
+        gate.confidence ?? 0, [], [], t.openedAt,
+        {
+          signalScore: gate.signal, rawScore: gate.rawScore ?? null,
+          requestedSize: gate.requestedSize ?? orderQuantity, finalSize: orderQuantity,
+          reductionReason: null, orderType: "SPX_DRY_RUN_SIMULATED",
+        },
+      );
+    } catch (e: any) {
+      this.log("error", `[SPX_TELEGRAM_ERROR] ${e.message}`);
+    }
+
+    this.log("trade", `[SPX_TRADE_OPEN] 🟢 SPX OPTION ${ct.toUpperCase()} | Strike:$${opt.strike} | Exp:${opt.expiry} | Entry:$${fillPrice.toFixed(2)} | Stop:$${stopPremium.toFixed(2)} | Target:$${targetPremium.toFixed(2)} | Δ${Math.abs(opt.delta).toFixed(3)} | Spread:$${spread.toFixed(2)} | Contracts:${orderQuantity} | DRY_RUN`, {
+      tradeId: t.id, symbol: underlying, underlying, optionSide: ct.toUpperCase(),
+      bid: opt.bid, ask: opt.ask, premium: fillPrice,
+      contractDetails: this.formatContractDetails(opt, s, fillPrice),
+    });
+  }
+  // ========== END SPX OPTIONS DRY_RUN ==========
 
   private async openTrade(underlying: string, conf: Confirmation[], opt: OptionQuote, gate?: SmartBrainGate, executionTrace?: ExecutionTrace) {
     const s = this.config.activeStrategy as Strategy;

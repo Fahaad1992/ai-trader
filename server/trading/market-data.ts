@@ -7,7 +7,7 @@
  * - If required IBKR/Polygon data is unavailable: NO trade, explicit block only
  */
 import { ibkr, type IBKRStockData, type IBKROptionData } from "./ibkr-client.js";
-import { isFuturesMode } from "./trade-mode.js";
+import { isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
 
 const POLYGON_KEY = process.env.POLYGON_API_KEY || "";
 const POLYGON_ENABLED = POLYGON_KEY.length > 10; // retained for dormant compatibility only
@@ -498,7 +498,7 @@ export class MarketDataProvider {
   }
 
   async loadPrices(): Promise<boolean> {
-    const tickers = isFuturesMode() ? [FUTURES_UNDERLYING, "VIX"] : ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "MSFT", "META", "AMZN"];
+    const tickers = isSPXOptionsMode() ? ["SPX", "VIX"] : isFuturesMode() ? [FUTURES_UNDERLYING, "VIX"] : ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "MSFT", "META", "AMZN"];
     let success = 0;
 
     if (!(this.ibkrMode && ibkr.isConnected())) {
@@ -540,7 +540,7 @@ export class MarketDataProvider {
   }
 
   hasRealData(): boolean {
-    return isFuturesMode() ? (this.loaded && !!this.prices[FUTURES_UNDERLYING]) : (this.loaded && !!this.prices["SPY"] && !!this.prices["QQQ"]);
+    return isSPXOptionsMode() ? (this.loaded && !!this.prices["SPX"]) : isFuturesMode() ? (this.loaded && !!this.prices[FUTURES_UNDERLYING]) : (this.loaded && !!this.prices["SPY"] && !!this.prices["QQQ"]);
   }
 
   isConfigured(): boolean {
@@ -548,7 +548,7 @@ export class MarketDataProvider {
   }
 
   getDataTimestamp(): number {
-    return isFuturesMode() ? (this.prices[FUTURES_UNDERLYING]?.timestamp || 0) : (this.prices["SPY"]?.timestamp || 0);
+    return isSPXOptionsMode() ? (this.prices["SPX"]?.timestamp || 0) : isFuturesMode() ? (this.prices[FUTURES_UNDERLYING]?.timestamp || 0) : (this.prices["SPY"]?.timestamp || 0);
   }
 
   isDataFresh(maxAgeMs: number = 300_000): boolean {
@@ -709,7 +709,7 @@ export class MarketDataProvider {
   }
 
   async refreshPrices(): Promise<void> {
-    const tickers = isFuturesMode() ? [FUTURES_UNDERLYING, "VIX"] : ["SPY", "QQQ"];
+    const tickers = isSPXOptionsMode() ? ["SPX", "VIX"] : isFuturesMode() ? [FUTURES_UNDERLYING, "VIX"] : ["SPY", "QQQ"];
     for (const t of tickers) {
       stockCache.delete(`ibkr_${t}`);
       stockCache.delete(t);
