@@ -511,3 +511,62 @@ export function notifyHealthFailure(details: string): void {
 
 🧾 التفاصيل: ${details}`);
 }
+
+// ========== SPX OPTIONS TELEGRAM ==========
+
+export function notifySPXEntry(
+  type: "call" | "put", strike: number, expiry: string,
+  entryPremium: number, stopPremium: number,
+  passed: number, total: number, confidence: number,
+): void {
+  const label = type === "call" ? "SPX CALL طلوع" : "SPX PUT نزول";
+  const msg = `✅ صفقة SPX Options
+
+📌 ${label}
+💰 Strike: <b>$${strike}</b>
+📅 انتهاء: <b>${expiry}</b>
+💵 دخول: <b>$${entryPremium.toFixed(2)}</b>
+🛡️ وقف: <b>$${stopPremium.toFixed(2)}</b>
+📋 الخطة: ترقية الوقف مع الربح
+📊 التأكيدات: <b>${passed}/${total}</b>
+🎯 الثقة: <b>${confidence > 0 ? confidence + "%" : "—"}</b>
+⚙️ DRY_RUN`;
+  send("SPX_TRADE_OPEN", msg, `SPX ${type.toUpperCase()} strike=$${strike} exp=${expiry} entry=$${entryPremium.toFixed(2)} stop=$${stopPremium.toFixed(2)}`);
+}
+
+export function notifySPXStopUpdate(
+  type: "call" | "put", oldStop: number, newStop: number,
+  stage: string, currentPremium: number, entryPremium: number,
+): void {
+  const label = type === "call" ? "CALL طلوع" : "PUT نزول";
+  const pnl = Math.round((currentPremium - entryPremium) * 100 * 100) / 100;
+  const pnlIcon = pnl >= 0 ? "🟢" : "🔴";
+  const msg = `🔄 ترقية وقف SPX
+
+📌 ${label}
+🛡️ وقف سابق: <b>$${oldStop.toFixed(2)}</b>
+🛡️ وقف جديد: <b>$${newStop.toFixed(2)}</b>
+📋 المرحلة: <b>${stage}</b>
+${pnlIcon} PnL: <b>$${pnl.toFixed(2)}</b>`;
+  send("SPX_STOP_UPDATE", msg, `SPX ${type.toUpperCase()} oldStop=$${oldStop.toFixed(2)} newStop=$${newStop.toFixed(2)} stage=${stage} pnl=$${pnl.toFixed(2)}`);
+}
+
+export function notifySPXClose(
+  type: "call" | "put", entryPremium: number, exitPremium: number,
+  reason: string, durationMs: number,
+): void {
+  const label = type === "call" ? "CALL طلوع" : "PUT نزول";
+  const pnl = Math.round((exitPremium - entryPremium) * 100 * 100) / 100;
+  const pnlPct = entryPremium > 0 ? Math.round(((exitPremium - entryPremium) / entryPremium) * 10000) / 100 : 0;
+  const pnlIcon = pnl >= 0 ? "🟢" : "🔴";
+  const minutes = Math.floor(durationMs / 60_000);
+  const msg = `${pnl >= 0 ? "🟢" : "🔴"} إغلاق SPX Options
+
+📌 ${label}
+💵 دخول: <b>$${entryPremium.toFixed(2)}</b>
+💵 خروج: <b>$${exitPremium.toFixed(2)}</b>
+${pnlIcon} النتيجة: <b>$${pnl.toFixed(2)} (${pnlPct.toFixed(1)}%)</b>
+📋 السبب: <b>${translateExitReason(reason)}</b>
+⏰ المدة: <b>${minutes}د</b>`;
+  send("SPX_TRADE_CLOSE", msg, `SPX ${type.toUpperCase()} entry=$${entryPremium.toFixed(2)} exit=$${exitPremium.toFixed(2)} pnl=$${pnl.toFixed(2)} reason=${reason}`);
+}
