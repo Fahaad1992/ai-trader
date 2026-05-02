@@ -2,9 +2,21 @@
 
 > Owner decision. This rule is mandatory for all SPX Options work.
 
-## Rule
+## Data Source
 
-SPX Options scalping requires **real-time or near real-time data only**.
+**IBKR is the required primary data source for SPX Options.**
+
+- No Polygon fallback for SPX trading decisions.
+- DRY_RUN must use the same data source as future LIVE (IBKR).
+- Polygon $199 plan is not required now.
+
+## Quote Freshness (owner-approved)
+
+- `quoteAge = now - last option bid/ask timestamp`
+- `quoteAge > 2000ms` → block with `SPX_QUOTE_STALE`
+- Preferred quoteAge: `< 1000ms`
+- Missing timestamp → block with `SPX_REALTIME_DATA_REQUIRED`
+- Missing bid/ask → block with `SPX_PREMIUM_MISSING`
 
 ## Hard Rules
 
@@ -19,27 +31,31 @@ SPX Options scalping requires **real-time or near real-time data only**.
 9. Do not silently use MES or index price as option premium.
 10. Do not use delayed data to justify any SPX trade.
 
-## Implementation Requirement
+## IBKR Requirements
 
-Before implementing any exact freshness threshold (e.g. 5 seconds, 10 seconds, 30 seconds), the developer **must ask the owner for explicit approval**.
+- OPRA / US Options real-time data subscription
+- CBOE Streaming Market Indexes for SPX index price
+- SPX Options trading permission on account
+- IBKR Gateway authenticated and connected
+- No delayed/frozen data
 
-Do not choose critical timing values silently.
+## Architecture
 
-## Applies To
+- No full SPX option chain scan in LIVE.
+- Monitor only 3–5 near-ATM SPX option contracts.
+- Use `reqContractDetails` before accepting a selected contract.
+- Use `reqMktData` for selected contracts.
+- Require bid/ask, timestamp, quoteAge, and spread.
+- IBKR disconnected → block all SPX trades.
+- dataFarm disconnected → block all SPX trades.
+- No Polygon fallback.
 
-- SPX index live price
-- SPX option bid/ask
-- Selected option quote
-- Option chain data
-- Telegram reports
-- Bot dashboard / frontend
-- Daily or live trade reports when describing active market state
+## Blocker Codes
 
-## Blocker Code
+| Code | Trigger |
+|------|---------|
+| `SPX_QUOTE_STALE` | quoteAge > 2000ms |
+| `SPX_REALTIME_DATA_REQUIRED` | missing timestamp or no real-time source |
+| `SPX_PREMIUM_MISSING` | bid=0 or ask=0 |
 
-If real-time data is not available:
-```
-SPX_REALTIME_DATA_REQUIRED
-```
-
-This blocks trade entry. No degraded/delayed mode is acceptable.
+These block trade entry. No degraded/delayed mode is acceptable.
