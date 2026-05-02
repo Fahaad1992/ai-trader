@@ -775,7 +775,7 @@ export class TradingEngine {
     // LIVE_CAUTIOUS: Consecutive losses guard
     const consecLosses = (this as any).consecutiveLosses || 0;
     if (consecLosses >= 2) return `CONSECUTIVE_LOSSES:${consecLosses}`;
-    const allowPaperDelayedMarketData = this.config.mode === "paper" && ibkrStatus.marketDataMode === "delayed";
+    const allowPaperDelayedMarketData = this.config.mode === "paper" && ibkrStatus.marketDataMode === "delayed" && !isSPXOptionsMode();
     if (!allowPaperDelayedMarketData && (ibkrStatus.requestedMarketDataType !== "LIVE" || ibkrStatus.marketDataMode !== "live")) {
       return `IBKR_MARKET_DATA_NOT_LIVE:${ibkrStatus.marketDataMode}`;
     }
