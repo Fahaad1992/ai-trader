@@ -1921,7 +1921,7 @@ export class TradingEngine {
       opt = await market.findOption(
         underlying, ct,
         [SPX_DELTA_MIN_PLACEHOLDER, SPX_DELTA_MAX_PLACEHOLDER],
-        [0.10, SPX_MAX_PREMIUM],
+        [0.10, SPX_MAX_PREMIUM],  // min 0.10 is search floor only; dead/cheap contracts blocked by quality checks below
         1
       );
     } catch (e: any) {
@@ -1955,9 +1955,20 @@ export class TradingEngine {
       return this.rejectOptionQuality(underlying, ct, opt, `SPX_DELTA_OUT_OF_RANGE: ${absDelta.toFixed(3)} outside ${SPX_DELTA_MIN_PLACEHOLDER}-${SPX_DELTA_MAX_PLACEHOLDER} (placeholder)`, "spx_delta_out_of_range");
     }
 
-    const dataAge = Date.now() - (opt.timestamp || 0);
     if (!Number.isFinite(opt.timestamp) || opt.timestamp === 0) {
       return this.rejectOptionQuality(underlying, ct, opt, `SPX_REALTIME_DATA_REQUIRED: no timestamp on quote`, "spx_realtime_data_required");
+    }
+
+    if (opt.volume <= 0 && opt.openInterest <= 0) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_DEAD_OPTION_CONTRACT: volume=${opt.volume} OI=${opt.openInterest}`, "spx_dead_option_contract");
+    }
+
+    if (opt.volume <= 0) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_LOW_LIQUIDITY: volume=${opt.volume} OI=${opt.openInterest}`, "spx_low_liquidity");
+    }
+
+    if (opt.bid === opt.ask && opt.last <= 0) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_PREMIUM_NOT_MOVING: bid=ask=$${opt.bid} last=$${opt.last}`, "spx_premium_not_moving");
     }
 
     const spreadPct = opt.mid > 0 ? (spread / opt.mid) * 100 : 999;
