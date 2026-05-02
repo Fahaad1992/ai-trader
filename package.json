@@ -27,6 +27,7 @@
     "dayjs": "^1.11.13",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
+    "ib": "^0.2.9",
     "lucide-react": "^0.469.0",
     "node-telegram-bot-api": "^0.67.0",
     "react": "^19.0.0",
