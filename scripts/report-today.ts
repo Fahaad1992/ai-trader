@@ -153,13 +153,12 @@ async function main() {
     if (r.status === "open") openCount++; else closedCount++;
     const inferredSide = (() => {
       if (r.side) return r.side;
-      // legacy heuristic: contract_type=call → LONG; put → SHORT; future or null → unknown
-      if (r.contract_type === "call") return "LONG";
-      if (r.contract_type === "put") return "SHORT";
+      if (r.contract_type === "call") return r.trade_mode === "spx_options" ? "CALL" : "LONG";
+      if (r.contract_type === "put") return r.trade_mode === "spx_options" ? "PUT" : "SHORT";
       return null;
     })();
-    if (inferredSide === "LONG") longCount++;
-    else if (inferredSide === "SHORT") shortCount++;
+    if (inferredSide === "LONG" || inferredSide === "CALL") longCount++;
+    else if (inferredSide === "SHORT" || inferredSide === "PUT") shortCount++;
     else sideUnknownCount++;
     if ((r.close_reason ?? "").toLowerCase().includes("cleanup")) cleanupCount++;
     if (typeof r.quantity === "number") {
@@ -220,8 +219,8 @@ async function main() {
   lines.push("| Metric | Value |");
   lines.push("|---|---:|");
   lines.push(`| Total trades | ${total} (open:${openCount}, closed:${closedCount}) |`);
-  lines.push(`| LONG count | ${longCount} |`);
-  lines.push(`| SHORT count | ${shortCount} |`);
+  lines.push(`| CALL/LONG count | ${longCount} |`);
+  lines.push(`| PUT/SHORT count | ${shortCount} |`);
   lines.push(`| Side unknown | ${sideUnknownCount} |`);
   lines.push(`| Cleanup count | ${cleanupCount} |`);
   lines.push(`| Quantity max / any qty>1 | ${qtyMax} / ${anyQtyGt1 ? "YES" : "NO"} |`);
@@ -254,7 +253,7 @@ async function main() {
   lines.push("|---|---|---|---:|---:|---:|---:|---:|---|---|---:|---|");
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
-    const side = r.side ?? (r.contract_type === "call" ? "LONG?" : r.contract_type === "put" ? "SHORT?" : "?");
+    const side = r.side ?? (r.contract_type === "call" ? (r.trade_mode === "spx_options" ? "CALL" : "LONG?") : r.contract_type === "put" ? (r.trade_mode === "spx_options" ? "PUT" : "SHORT?") : "?");
     const stop = r.stop_price != null ? r.stop_price.toFixed(2) : "-";
     const tgt  = r.target_price != null ? r.target_price.toFixed(2) : "-";
     const ex   = r.exit_premium != null ? r.exit_premium.toFixed(2) : "-";
