@@ -1,9 +1,19 @@
 import type { BotConfig, BotLog, BotStatus, Trade } from "../../shared/types.js";
 
-export type RuntimeTradeMode = "options" | "futures";
+export type RuntimeTradeMode = "options" | "futures" | "spx_options";
 
 const RAW_TRADE_MODE = String(process.env.TRADE_MODE || "options").trim().toLowerCase();
-export const TRADE_MODE: RuntimeTradeMode = RAW_TRADE_MODE === "futures" ? "futures" : "options";
+
+function resolveTradeMode(): RuntimeTradeMode {
+  if (RAW_TRADE_MODE === "futures") {
+    console.error("[MES_FUTURES_DISABLED_SPX_ONLY] TRADE_MODE=futures is no longer supported. MES Futures has been removed from active modes. Set TRADE_MODE=spx_options or TRADE_MODE=options.");
+    return "futures";
+  }
+  if (RAW_TRADE_MODE === "spx_options") return "spx_options";
+  return "options";
+}
+
+export const TRADE_MODE: RuntimeTradeMode = resolveTradeMode();
 
 const OPTION_FIELD_KEYS = new Set([
   "optionTicker",
@@ -40,11 +50,22 @@ export function getTradeMode(): RuntimeTradeMode {
 }
 
 export function isFuturesMode(): boolean {
+  if (TRADE_MODE === "futures") {
+    console.warn("[MES_FUTURES_DISABLED_SPX_ONLY] isFuturesMode() called but MES Futures is disabled. Returning true to block futures-only code paths.");
+  }
   return TRADE_MODE === "futures";
+}
+
+export function isSPXOptionsMode(): boolean {
+  return TRADE_MODE === "spx_options";
 }
 
 export function isOptionsMode(): boolean {
   return TRADE_MODE === "options";
+}
+
+export function isFuturesDisabled(): boolean {
+  return RAW_TRADE_MODE === "futures";
 }
 
 export function getOptionsRuntimeGuardMessage(scope: string): string {

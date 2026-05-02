@@ -99,6 +99,7 @@ export default function SettingsPage() {
   };
 
   const isFuturesMode = local.tradeMode === "futures";
+  const isSPXMode = local.tradeMode === "spx_options";
   const unlimitedTradesLabel = isFuturesMode ? "غير محدود" : String(local.risk.maxTradesPerDay);
 
   return (
@@ -113,41 +114,55 @@ export default function SettingsPage() {
         </button>
       </div>
 
+      {isFuturesMode && (
+        <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-4 text-sm">
+          <div className="flex items-start gap-2">
+            <ShieldCheck className="h-4 w-4 text-red-400 mt-0.5" />
+            <div className="space-y-1">
+              <p className="font-medium text-red-300">MES Futures معطّل</p>
+              <p className="text-muted-foreground">
+                وضع <span className="text-foreground font-semibold">TRADE_MODE=futures</span> لم يعد مدعوماً. الاتجاه الجديد هو <span className="text-foreground font-semibold">SPX Options</span>. يرجى تغيير <span className="text-foreground font-semibold">TRADE_MODE=spx_options</span> في ملف <span className="text-foreground font-semibold">.env</span>.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-sm">
         <div className="flex items-start gap-2">
           <ShieldCheck className="h-4 w-4 text-emerald-400 mt-0.5" />
           <div className="space-y-1">
-            <p className="font-medium text-emerald-300">سياسة Futures المعتمدة</p>
+            <p className="font-medium text-emerald-300">{isSPXMode ? "وضع SPX Options" : "سياسة التداول"}</p>
             <p className="text-muted-foreground">
-              تبقى إعدادات الأوبشن كاملة داخل المشروع، لكنها تُخفى من الواجهة عندما يكون <span className="text-foreground font-semibold">TRADE_MODE=futures</span>. كما أن <span className="text-foreground font-semibold">نوع الأصل</span> و<span className="text-foreground font-semibold">Trailing Distance</span> و<span className="text-foreground font-semibold">Initial Stop</span> أصبحت للعرض فقط، بينما يُحسب حد الخسارة اليومي من الرصيد الحقيقي القادم من IBKR فقط عند توفره.
+              {isSPXMode
+                ? <>الاتجاه الحالي: <span className="text-foreground font-semibold">SPX Options scalping</span>. يستخدم أوبشن CALL/PUT على SPX مع stop/target/trailing على premium الأوبشن. PnL = تغير premium × 100 × عدد العقود.</>
+                : <>تبقى إعدادات الأوبشن كاملة داخل المشروع. حد الخسارة اليومي يُحسب من الرصيد الحقيقي القادم من IBKR فقط عند توفره.</>
+              }
             </p>
           </div>
         </div>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <Section title="الوضع والتنفيذ" badge={isFuturesMode ? "Futures" : undefined}>
+        <Section title="الوضع والتنفيذ" badge={isFuturesMode ? "Futures (معطّل)" : isSPXMode ? "SPX Options" : undefined}>
           <StaticField label="وضع التداول" value={local.mode === "live" ? "حقيقي" : "ورقي"} />
           <StaticField label="الاستراتيجية النشطة" value="حلب سريع فقط" note="المحرك يفرض هذه الاستراتيجية في المسار الحالي." />
-          <StaticField label="مصدر التنفيذ" value={local.futures.executionBroker} />
+          <StaticField label="وضع التشغيل" value={isSPXMode ? "SPX Options" : isFuturesMode ? "MES Futures (معطّل)" : "Options عام"} note={isFuturesMode ? "MES Futures لم يعد مدعوماً. غيّر TRADE_MODE في .env" : undefined} />
           <StaticField label="مصدر بيانات الرصيد" value="IBKR API مباشرة" />
         </Section>
 
-        <Section title="إعدادات Futures الثابتة" badge="قراءة فقط">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <StaticField label="نوع الأصل" value={local.futures.assetType} note="Read-only" />
-            <StaticField label="Trailing Distance" value={`${local.futures.trailingStopPoints} نقطة`} note="Read-only" />
-            <StaticField label="Initial Stop" value={`${local.futures.initialStopPoints} نقاط`} note="Read-only" />
-            <StaticField label="Max Contracts" value={String(local.futures.maxContracts)} note="الحد الأقصى المسموح به للمسار الحالي" />
-            <StaticField label="Daily Loss Limit" value={`${local.futures.dailyLossLimitPercent}% من الرصيد الحقيقي`} note="يُحسب تلقائيًا من IBKR عند توفر البيانات الحقيقية" />
-            <StaticField label="Balance Refresh" value={`${local.futures.balanceRefreshSeconds} ثانية`} note="مزامنة دورية مع IBKR" />
-          </div>
-        </Section>
+        {isFuturesMode && (
+          <Section title="إعدادات Futures" badge="معطّل — MES_FUTURES_DISABLED_SPX_ONLY">
+            <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-sm text-muted-foreground">
+              وضع MES Futures معطّل. الاتجاه الجديد هو SPX Options. لعرض إعدادات SPX، غيّر <span className="font-semibold text-foreground">TRADE_MODE=spx_options</span> في ملف .env.
+            </div>
+          </Section>
+        )}
 
         <Section title="إدارة المخاطر القابلة للتعديل">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <StaticField label="أقصى صفقات/يوم" value={unlimitedTradesLabel} note="في Futures لا يوجد حد يومي لعدد الصفقات." />
-            <StaticField label="أقصى خسارة يومية" value={`${local.futures.dailyLossLimitPercent}%`} note="تُشتق من الرصيد الحقيقي ولا تُضبط يدويًا." />
+            <StaticField label="أقصى صفقات/يوم" value={unlimitedTradesLabel} note={isFuturesMode ? "في Futures لا يوجد حد يومي لعدد الصفقات." : undefined} />
+            <StaticField label="أقصى خسارة يومية" value={`${local.risk.maxDailyLossPercent}%`} note="تُشتق من الرصيد الحقيقي ولا تُضبط يدويًا." />
             <Num label="أقصى خسائر متتالية" value={local.risk.maxConsecutiveLosses} onChange={(v) => u("risk.maxConsecutiveLosses", v)} min={1} max={10} />
             <Num label="فترة الانتظار" value={local.risk.cooldownMinutes} onChange={(v) => u("risk.cooldownMinutes", v)} min={0} max={60} suffix="دقيقة" />
           </div>
@@ -160,13 +175,13 @@ export default function SettingsPage() {
         </Section>
 
         {isFuturesMode ? (
-          <Section title="إعدادات Options" badge="مخفية في Futures mode">
+          <Section title="إعدادات Options" badge="معطّل — غيّر TRADE_MODE">
             <div className="rounded-xl border border-border/60 bg-secondary/20 p-4 text-sm text-muted-foreground">
-              إعدادات Options ما زالت موجودة بالكامل داخل الكود وضمن التهيئة الحالية، لكنها مخفية من هذه الواجهة لأن وضع التشغيل الحالي هو <span className="font-semibold text-foreground">futures</span>.
+              وضع MES Futures معطّل. غيّر <span className="font-semibold text-foreground">TRADE_MODE=spx_options</span> في ملف .env لعرض إعدادات SPX Options.
             </div>
           </Section>
         ) : (
-          <Section title="إعدادات Options">
+          <Section title={isSPXMode ? "إعدادات SPX Options" : "إعدادات Options"}>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <Num label="أقل دلتا" value={local.options.deltaMin} onChange={(v) => u("options.deltaMin", v)} min={0.05} max={1} step={0.05} />
               <Num label="أعلى دلتا" value={local.options.deltaMax} onChange={(v) => u("options.deltaMax", v)} min={0.05} max={1} step={0.05} />

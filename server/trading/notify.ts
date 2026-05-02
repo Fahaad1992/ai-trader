@@ -1,4 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
+import { isSPXOptionsMode } from "./trade-mode.js";
 
 const TOKEN = process.env.TG_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
@@ -122,6 +123,7 @@ function formatOptionType(type: string): string {
 }
 
 function isFuturesSide(type: string): boolean {
+  if (isSPXOptionsMode()) return false;
   const v = String(type || "").toUpperCase();
   return v === "LONG" || v === "SHORT";
 }
