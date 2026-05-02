@@ -778,24 +778,30 @@ export class MarketDataProvider {
       }
     }
 
+    const SPX_SNAPSHOT_TIMEOUT_MS = 3_000;
+
     const results = await Promise.allSettled(
       requests.map(async ({ strike, expiry }) => {
-        const snapshot = await ibkr.getOptionSnapshot("SPX", type, strike, expiry);
+        const snapshot = await Promise.race([
+          ibkr.getOptionSnapshot("SPX", type, strike, expiry),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), SPX_SNAPSHOT_TIMEOUT_MS)),
+        ]);
         return snapshot ? { ...snapshot, _strike: strike, _expiry: expiry } : null;
       })
     );
 
+    let timeoutCount = 0;
     const candidates: OptionQuote[] = [];
     for (const r of results) {
-      if (r.status !== "fulfilled" || !r.value) continue;
+      if (r.status !== "fulfilled" || !r.value) {
+        timeoutCount++;
+        continue;
+      }
       const snap = r.value;
       if (!(snap.bid > 0) || !(snap.ask > 0)) continue;
 
       const premium = snap.ask;
       if (premium < premiumRange[0] || premium > premiumRange[1]) continue;
-
-      const spread = snap.ask - snap.bid;
-      const absDelta = Math.abs(snap.delta || 0);
 
       const expFormatted = `${snap._expiry.slice(0, 4)}-${snap._expiry.slice(4, 6)}-${snap._expiry.slice(6, 8)}`;
       const dte = Math.max(0, Math.round((Date.parse(`${expFormatted}T20:00:00Z`) - Date.now()) / 86_400_000));
@@ -812,7 +818,7 @@ export class MarketDataProvider {
         last: snap.last || 0,
         volume: snap.volume || 0,
         openInterest: snap.openInterest || 0,
-        delta: snap.delta || 0,
+        delta: snap.delta,
         gamma: snap.gamma || 0,
         theta: snap.theta || 0,
         vega: snap.vega || 0,
@@ -820,23 +826,37 @@ export class MarketDataProvider {
         dte,
         moneyness: Math.abs(snap._strike - spxPrice) < strikeInterval ? "ATM" : (type === "call" ? (snap._strike < spxPrice ? "ITM" : "OTM") : (snap._strike > spxPrice ? "ITM" : "OTM")),
         source: "ibkr" as const,
-        timestamp: snap.timestamp || Date.now(),
+        timestamp: snap.timestamp || 0,
         delayed: false,
       });
     }
 
+    if (timeoutCount > 0) {
+      console.warn(`[SPX_IBKR_SNAPSHOT_TIMEOUT] ${timeoutCount}/${requests.length} snapshots timed out (>${SPX_SNAPSHOT_TIMEOUT_MS}ms)`);
+    }
+
     if (candidates.length === 0) {
-      console.warn(`[SPX_NO_VALID_CONTRACT] No SPX ${type} contracts passed filters from IBKR`);
+      console.warn(`[SPX_NO_VALID_CONTRACT] No SPX ${type} contracts passed filters from IBKR (timeouts=${timeoutCount})`);
       return null;
     }
 
-    const filtered = candidates.filter(c => {
+    const withDelta = candidates.filter(c => Number.isFinite(c.delta) && c.delta !== 0);
+    if (withDelta.length === 0) {
+      console.warn(`[SPX_DELTA_UNAVAILABLE] All ${candidates.length} SPX candidates have delta=0 or missing. IBKR may not provide Greeks without OPRA subscription.`);
+      return null;
+    }
+
+    const filtered = withDelta.filter(c => {
       const absDelta = Math.abs(c.delta);
-      if (absDelta > 0 && (absDelta < deltaRange[0] || absDelta > deltaRange[1])) return false;
-      return true;
+      return absDelta >= deltaRange[0] && absDelta <= deltaRange[1];
     });
 
-    const pool = filtered.length > 0 ? filtered : candidates;
+    if (filtered.length === 0) {
+      console.warn(`[SPX_DELTA_OUT_OF_RANGE] ${withDelta.length} candidates had delta but none in range ${deltaRange[0]}-${deltaRange[1]}`);
+      return null;
+    }
+
+    const pool = filtered;
     pool.sort((a, b) => {
       const spreadA = a.ask - a.bid;
       const spreadB = b.ask - b.bid;
