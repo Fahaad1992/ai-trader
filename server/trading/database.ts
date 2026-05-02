@@ -39,6 +39,14 @@ try {
     ["slippage",               "REAL"],
     ["requested_size",         "INTEGER"],
     ["final_size",             "INTEGER"],
+    ["premium_stop",           "REAL"],
+    ["premium_target",         "REAL"],
+    ["iv",                     "REAL"],
+    ["bid",                    "REAL"],
+    ["ask",                    "REAL"],
+    ["mid",                    "REAL"],
+    ["spread",                 "REAL"],
+    ["right",                  "TEXT"],
   ];
   for (const [col, typ] of _adds) {
     if (!_existing.includes(col)) {

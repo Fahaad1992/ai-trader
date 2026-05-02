@@ -1,5 +1,5 @@
 export type TradingMode = "paper" | "live";
-export type TradeRuntimeMode = "options" | "futures";
+export type TradeRuntimeMode = "options" | "futures" | "spx_options";
 export type Strategy = "milking" | "hold" | "zeroHero";
 export type ContractType = "call" | "put";
 export type CloseReason = "trailing-stop" | "stop-loss" | "manual" | "expiry" | "risk-limit";

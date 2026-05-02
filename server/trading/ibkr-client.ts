@@ -3,7 +3,7 @@
  * Uses @stoqey/ib library for real-time market data and order execution
  */
 import IB from "ib";
-import { assertOptionsRuntimeAllowed, isFuturesMode } from "./trade-mode.js";
+import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
 
 type IBApi = any;
 type Contract = Record<string, any>;
@@ -871,6 +871,9 @@ class IBKRClient {
     symbol: string,
     contractMonth: string,
   ): Contract {
+    if (isSPXOptionsMode()) {
+      throw new Error("[MES_FUTURES_DISABLED_SPX_ONLY] buildFuturesContract blocked: SPX Options mode does not use FUT contracts");
+    }
     return {
       symbol,
       secType: SecType.FUT,
@@ -897,6 +900,10 @@ class IBKRClient {
     stopLossPrice: number,
     targetPrice?: number,
   ): Promise<IBKROrderResult | null> {
+    if (isSPXOptionsMode()) {
+      console.warn("[MES_FUTURES_DISABLED_SPX_ONLY] placeFuturesBracket blocked: SPX Options mode does not use FUT bracket orders");
+      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0, avgFillPrice: 0, lastFillPrice: 0, rejectReason: "MES_FUTURES_DISABLED_SPX_ONLY", errorMessage: "placeFuturesBracket blocked in SPX Options mode" } as IBKROrderResult;
+    }
     if (!this.connected || !this.ib) return null;
     if (!symbol || typeof symbol !== "string") {
       console.warn("[FUT_BRACKET] aborted: missing symbol");
