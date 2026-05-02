@@ -7,8 +7,16 @@
 *.pem
 *.key
 *.crt
+*.secret
 id_rsa
 id_rsa.*
+ACCOUNTS-REFERENCE.md
+*ACCOUNTS*
+*credentials*
+*secrets*
+*password*
+secrets/
+credentials/
 
 # --- build / deps ---
 node_modules/
