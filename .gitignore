@@ -2,12 +2,21 @@
 .env
 .env.*
 *.env
+!.env.example
 *.env.bak*
 *.pem
 *.key
 *.crt
+*.secret
 id_rsa
 id_rsa.*
+ACCOUNTS-REFERENCE.md
+*ACCOUNTS*
+*credentials*
+*secrets*
+*password*
+secrets/
+credentials/
 
 # --- build / deps ---
 node_modules/
@@ -30,6 +39,7 @@ manual_monitor_events.log
 
 # --- backups ---
 backups/
+backup_*/
 *.bak
 *.bak.*
 *.backup
