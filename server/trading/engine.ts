@@ -302,27 +302,25 @@ type AssetStopProfile = {
 const INDEX_STOP_UNDERLYINGS = new Set(["SPX", "NDX", "QQQ"]);
 const SINGLE_STOCK_STOP_UNDERLYINGS = new Set(["NVDA", "TSLA", "AMZN"]);
 
-// ========== SPX OPTIONS DRY_RUN PARAMETERS ==========
-// --- OWNER-APPROVED ---
+// ========== SPX OPTIONS DRY_RUN PARAMETERS (all owner-approved) ==========
 const SPX_INITIAL_STOP_PERCENT = 0.40;
 const SPX_MAX_CONTRACTS = 1;
 const SPX_MAX_PREMIUM = 5.00;
 const SPX_UNDERLYING = "SPX";
-// --- PLACEHOLDERS — NOT OWNER-APPROVED — must not gate live trading ---
-const SPX_MAX_SPREAD_PLACEHOLDER = 0.50;
-const SPX_DELTA_MIN_PLACEHOLDER = 0.35;
-const SPX_DELTA_MAX_PLACEHOLDER = 0.60;
-// --- OWNER-APPROVED STOP UPGRADE (example entry $5.00) ---
-// above $5.30 (+6%) → stop ~$5.20 (entry + 4%)
+const SPX_MAX_SPREAD = 0.30;
+const SPX_DELTA_MIN = 0.40;
+const SPX_DELTA_MAX = 0.60;
+const SPX_QUOTE_MAX_AGE_MS = 2_000;
+// Stop upgrade (example entry $5.00):
+//   above $5.30 (+6%) → stop ~$5.20 (entry + 4%)
 const SPX_BE_TRIGGER_PERCENT = 0.06;
 const SPX_BE_LOCK_PERCENT = 0.04;
-// above $5.50 (+10%) → stop $5.50
+//   above $5.50 (+10%) → stop $5.50
 const SPX_PROFIT_LOCK_TRIGGER_PERCENT = 0.10;
-// after $5.50 → wider trailing begins
-// after +100% profit → stop continues upward, do not widen trailing further
+//   after +20% → wider trailing begins (distance 20% of entry)
+//   after +100% → trailing distance frozen, stop only up
 const SPX_TRAILING_ACTIVATE_PERCENT = 0.20;
-// --- PLACEHOLDER — trailing distance not owner-approved ---
-const SPX_TRAILING_DISTANCE_PLACEHOLDER = 0.15;
+const SPX_TRAILING_DISTANCE = 0.20;
 // ========== END SPX OPTIONS PARAMETERS ==========
 
 function roundOptionPrice(value: number): number {
@@ -375,7 +373,7 @@ function getSPXPremiumStop(entryPremium: number): number {
 function getSPXTrailingConfig(entryPremium: number): TrailingConfig {
   return {
     activation: roundSPXStop(entryPremium * SPX_TRAILING_ACTIVATE_PERCENT),
-    distance: roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PLACEHOLDER),
+    distance: roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE),
   };
 }
 
@@ -386,14 +384,14 @@ function getSPXTrailingConfig(entryPremium: number): TrailingConfig {
  *   after +20% → wider trailing begins                      [TRAILING]
  *   after +100% → trailing distance frozen, stop only up    [TRAILING_CAPPED]
  *   stop never moves backward
- *   trailing distance is PLACEHOLDER — not owner-approved
+ *   trailing distance = 20% of entry premium (owner-approved)
  */
 function getSPXStopUpgrade(entryPremium: number, currentPremium: number, currentStop: number): { newStop: number; stage: string } | null {
   const profitPct = (currentPremium - entryPremium) / entryPremium;
 
   if (profitPct >= SPX_TRAILING_ACTIVATE_PERCENT) {
     const cappedProfitPct = Math.min(profitPct, 1.00);
-    const trailDist = roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PLACEHOLDER);
+    const trailDist = roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE);
     const effectiveDist = cappedProfitPct >= 1.00 ? trailDist : trailDist;
     const candidate = roundSPXStop(currentPremium - effectiveDist);
     if (candidate > currentStop) return { newStop: candidate, stage: profitPct >= 1.00 ? "TRAILING_CAPPED" : "TRAILING" };
@@ -1912,7 +1910,7 @@ export class TradingEngine {
     const trendConf = conf.find(c => c.name === "trend");
     const ct: "call" | "put" = trendConf?.value?.includes("صاعد") ? "call" : "put";
 
-    this.log("info", `[SPX_OPTION_VALIDATE] جاري البحث عن ${ct.toUpperCase()} لـ ${underlying} | Delta:${SPX_DELTA_MIN_PLACEHOLDER}-${SPX_DELTA_MAX_PLACEHOLDER} (placeholder) | MaxPremium:$${SPX_MAX_PREMIUM} | MaxSpread:$${SPX_MAX_SPREAD_PLACEHOLDER} (placeholder)`, {
+    this.log("info", `[SPX_OPTION_VALIDATE] جاري البحث عن ${ct.toUpperCase()} لـ ${underlying} | Delta:${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | MaxPremium:$${SPX_MAX_PREMIUM} | MaxSpread:$${SPX_MAX_SPREAD}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
     });
 
@@ -1920,7 +1918,7 @@ export class TradingEngine {
     try {
       opt = await market.findOption(
         underlying, ct,
-        [SPX_DELTA_MIN_PLACEHOLDER, SPX_DELTA_MAX_PLACEHOLDER],
+        [SPX_DELTA_MIN, SPX_DELTA_MAX],
         [0.10, SPX_MAX_PREMIUM],  // min 0.10 is search floor only; dead/cheap contracts blocked by quality checks below
         1
       );
@@ -1929,7 +1927,7 @@ export class TradingEngine {
     }
 
     if (!opt) {
-      return this.rejectOptionQuality(underlying, ct, null, `لا يوجد عقد SPX بـ Delta ${SPX_DELTA_MIN_PLACEHOLDER}-${SPX_DELTA_MAX_PLACEHOLDER} | Premium $0.50-$${SPX_MAX_PREMIUM}`, "spx_contract_not_found");
+      return this.rejectOptionQuality(underlying, ct, null, `لا يوجد عقد SPX بـ Delta ${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | Premium ≤$${SPX_MAX_PREMIUM}`, "spx_contract_not_found");
     }
 
     if (!opt.ticker || !opt.expiry || !(opt.strike > 0)) {
@@ -1946,17 +1944,18 @@ export class TradingEngine {
     }
 
     const spread = opt.ask - opt.bid;
-    if (spread > SPX_MAX_SPREAD_PLACEHOLDER) {
-      return this.rejectOptionQuality(underlying, ct, opt, `SPX_SPREAD_TOO_WIDE: $${spread.toFixed(2)} > $${SPX_MAX_SPREAD_PLACEHOLDER} (placeholder)`, "spx_spread_too_wide");
+    if (spread > SPX_MAX_SPREAD) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_SPREAD_TOO_WIDE: $${spread.toFixed(2)} > $${SPX_MAX_SPREAD}`, "spx_spread_too_wide");
     }
 
     const absDelta = Math.abs(opt.delta);
-    if (!Number.isFinite(absDelta) || absDelta < SPX_DELTA_MIN_PLACEHOLDER || absDelta > SPX_DELTA_MAX_PLACEHOLDER) {
-      return this.rejectOptionQuality(underlying, ct, opt, `SPX_DELTA_OUT_OF_RANGE: ${absDelta.toFixed(3)} outside ${SPX_DELTA_MIN_PLACEHOLDER}-${SPX_DELTA_MAX_PLACEHOLDER} (placeholder)`, "spx_delta_out_of_range");
+    if (!Number.isFinite(absDelta) || absDelta < SPX_DELTA_MIN || absDelta > SPX_DELTA_MAX) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_DELTA_OUT_OF_RANGE: ${absDelta.toFixed(3)} outside ${SPX_DELTA_MIN}-${SPX_DELTA_MAX}`, "spx_delta_out_of_range");
     }
 
-    if (!Number.isFinite(opt.timestamp) || opt.timestamp === 0) {
-      return this.rejectOptionQuality(underlying, ct, opt, `SPX_REALTIME_DATA_REQUIRED: no timestamp on quote`, "spx_realtime_data_required");
+    const quoteAge = Date.now() - (opt.timestamp || 0);
+    if (!Number.isFinite(opt.timestamp) || opt.timestamp === 0 || quoteAge > SPX_QUOTE_MAX_AGE_MS) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_REALTIME_DATA_REQUIRED: quote age ${Number.isFinite(quoteAge) ? Math.round(quoteAge / 1000) + "s" : "unknown"} > ${SPX_QUOTE_MAX_AGE_MS / 1000}s`, "spx_realtime_data_required");
     }
 
     if (opt.volume <= 0 && opt.openInterest <= 0) {
@@ -2013,7 +2012,7 @@ export class TradingEngine {
     const beTrigger = roundSPXStop(fillPrice * (1 + SPX_BE_TRIGGER_PERCENT));
     const beLock = roundSPXStop(fillPrice * (1 + SPX_BE_LOCK_PERCENT));
 
-    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE_PLACEHOLDER * 100).toFixed(0)}% (placeholder) | contracts:${orderQuantity}`, {
+    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE * 100).toFixed(0)}% | contracts:${orderQuantity}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
     });
 
