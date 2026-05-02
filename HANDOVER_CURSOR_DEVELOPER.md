@@ -757,3 +757,24 @@ If yes or unknown:
 - stop
 - report
 - ask owner
+
+---
+
+## 26) SPX Options real-time data rule
+
+Owner decision: SPX Options scalping requires real-time or near real-time data only.
+
+Hard rules:
+- Never use 120 seconds or any arbitrary stale threshold as "fresh" for SPX.
+- Never call data fresh if it is delayed.
+- Trade entry must be blocked if quote freshness is not acceptable.
+- If data source is delayed, missing, or uncertain: block with `SPX_REALTIME_DATA_REQUIRED`.
+- Do not silently fall back to stale data.
+- Do not silently use MES or index price as option premium.
+- Do not use delayed data to justify any SPX trade.
+- Telegram must show stale/delayed warnings clearly.
+- Frontend must show stale/delayed warnings clearly.
+- Reports must not present delayed data as current.
+
+Before implementing any exact freshness threshold (e.g. 5s, 10s, 30s), ask owner for explicit approval.
+Do not choose critical timing values silently.
