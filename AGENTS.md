@@ -37,3 +37,22 @@ ai-trader is a TypeScript automated trading bot (Express backend + React/Vite fr
 ### Build
 
 - `pnpm run build` — Vite builds frontend to `dist/public`, esbuild bundles server to `dist/index.js`.
+
+### Communication format
+
+- Owner communication can be in Arabic.
+- Technical/code instructions to Cursor should be in English.
+- Final reports must be easy to copy and send to the owner.
+- Put every final report inside one fenced code block.
+- Avoid wide tables if possible. Use compact `key: value` format.
+- Required fields in every final report:
+  ```
+  summary:
+  files_changed:
+  commands_run:
+  build_result:
+  tests_result:
+  risks:
+  next_step:
+  ```
+- Do not bury important results in long prose.
