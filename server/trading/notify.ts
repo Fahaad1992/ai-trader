@@ -113,8 +113,10 @@ function formatMode(mode: string): string {
 
 function formatOptionType(type: string): string {
   const value = String(type || "").toUpperCase();
-  // ===== FUTURES LABELS =====
-  // For MES futures (DRY_RUN bidirectional), use LONG/SHORT instead of CALL/PUT.
+  if (isSPXOptionsMode()) {
+    if (value === "CALL" || value === "LONG") return "CALL طلوع";
+    if (value === "PUT" || value === "SHORT") return "PUT نزول";
+  }
   if (value === "LONG") return "شراء (LONG)";
   if (value === "SHORT") return "بيع (SHORT)";
   if (value === "CALL") return "كول";
