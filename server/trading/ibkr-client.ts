@@ -115,7 +115,7 @@ const IBKR_HOST = process.env.IBKR_HOST || "127.0.0.1";
 const IBKR_PORT = parseInt(process.env.IBKR_PORT || "4002");
 const IBKR_CLIENT_ID = parseInt(process.env.IBKR_CLIENT_ID || "1");
 const IBKR_TRADING_MODE = (process.env.IBKR_MODE || process.env.TRADING_MODE || process.env.BOT_MODE || "paper").toLowerCase();
-const IBKR_MARKET_DATA_TYPE = IBKR_TRADING_MODE === "live" ? 1 : 3;
+const IBKR_MARKET_DATA_TYPE = (IBKR_TRADING_MODE === "live" || isSPXOptionsMode()) ? 1 : 3;
 const IBKR_MARKET_DATA_TYPE_LABEL = IBKR_MARKET_DATA_TYPE === 1 ? "LIVE" : "DELAYED";
 const IBKR_MES_SYMBOL = process.env.IBKR_FUTURES_SYMBOL || "/MESM6";
 const MES_FUTURES_EXCHANGE = "CME";
@@ -212,6 +212,7 @@ class IBKRClient {
   private ib: IBApi | null = null;
   private connected = false;
   private connecting = false;
+  private connectTime = 0;
   private nextOrderId = 0;
   private accountId = "";
   private reqId = 1000;
@@ -308,6 +309,7 @@ class IBKRClient {
           if (this.ib !== client) return;
           console.log("[IBKR] Connected to IB Gateway!");
           this.connected = true;
+          this.connectTime = Date.now();
           this.connecting = false;
           this.clearConnectTimeout();
           // Use LIVE market data in live trading, otherwise fall back to DELAYED.
@@ -321,7 +323,8 @@ class IBKRClient {
 
         client.on(EventName.disconnected, () => {
           if (this.ib !== client) return;
-          console.log("[IBKR] Disconnected from IB Gateway");
+          const uptime = this.connected ? Date.now() - (this.connectTime || 0) : 0;
+          console.log(`[IBKR] Disconnected from IB Gateway | wasConnected=${this.connected} | uptimeMs=${uptime} | accountId=${this.accountId || "none"} | subscribedTickers=${Array.from(this.tickerReqMap.values()).join(",") || "none"}`);
           const wasConnected = this.connected;
           this.cleanupConnectionState({ disconnectSocket: false });
           if (!wasConnected) finalize(false);
