@@ -1914,20 +1914,23 @@ export class TradingEngine {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
     });
 
+    if (!market.isIBKRConnected()) {
+      return this.rejectOptionQuality(underlying, ct, null, "SPX_IBKR_DISCONNECTED: IBKR not connected — SPX requires IBKR data", "spx_ibkr_disconnected");
+    }
+
     let opt: OptionQuote | null = null;
     try {
-      opt = await market.findOption(
-        underlying, ct,
+      opt = await market.findSPXOptionIBKR(
+        ct,
         [SPX_DELTA_MIN, SPX_DELTA_MAX],
-        [0.10, SPX_MAX_PREMIUM],  // min 0.10 is search floor only; dead/cheap contracts blocked by quality checks below
-        1
+        [0.10, SPX_MAX_PREMIUM],
       );
     } catch (e: any) {
-      return this.rejectOptionQuality(underlying, ct, null, `SPX option lookup failed — ${e.message}`, "spx_contract_lookup_failed");
+      return this.rejectOptionQuality(underlying, ct, null, `SPX IBKR option lookup failed — ${e.message}`, "spx_ibkr_lookup_failed");
     }
 
     if (!opt) {
-      return this.rejectOptionQuality(underlying, ct, null, `لا يوجد عقد SPX بـ Delta ${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | Premium ≤$${SPX_MAX_PREMIUM}`, "spx_contract_not_found");
+      return this.rejectOptionQuality(underlying, ct, null, `لا يوجد عقد SPX بـ Delta ${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | Premium ≤$${SPX_MAX_PREMIUM} | source=IBKR`, "spx_contract_not_found");
     }
 
     if (!opt.ticker || !opt.expiry || !(opt.strike > 0)) {
