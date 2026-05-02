@@ -12,6 +12,8 @@ ai-trader is a TypeScript automated trading bot (Express backend + React/Vite fr
 - **Frontend**: `pnpm run dev:vite` (Vite on port 5173, proxies `/api` to backend)
 - Both must run simultaneously for full dev experience.
 
+> **WARNING**: Do not run backend/frontend servers unless explicitly requested by the owner. For setup verification, prefer `pnpm run build` only.
+
 ### Key gotchas
 
 - **Missing `ib` dependency**: The code imports `from "ib"` in `server/trading/ibkr-client.ts`, but `package.json` only declares `@stoqey/ib`. Run `pnpm add ib` if the package is missing after a clean install.
@@ -19,8 +21,8 @@ ai-trader is a TypeScript automated trading bot (Express backend + React/Vite fr
   ```
   cd node_modules/.pnpm/better-sqlite3@*/node_modules/better-sqlite3 && npm run build-release && cd /workspace
   ```
-- **Fresh DB schema mismatch**: On a fresh `data/trades.db`, the migration in `database.ts` runs *before* `CREATE TABLE`, causing a crash because the INSERT statement references columns (`side`, `mode_effective`, etc.) not in the base `CREATE TABLE`. Workaround: delete `data/trades.db` and pre-seed it with the full schema including all migration columns, or ensure the DB already exists with the correct schema before starting the server.
-- **DRY_RUN mode**: Always set `DRY_RUN=true` and `BE_FORCE_DRY_RUN=true` in `.env` to prevent any live order submission. The `.env` file is gitignored.
+- **Fresh DB schema mismatch**: On a fresh `data/trades.db`, the migration in `database.ts` runs *before* `CREATE TABLE`, causing a crash because the INSERT statement references columns (`side`, `mode_effective`, etc.) not in the base `CREATE TABLE`. **Never delete `data/trades.db`. It may contain trade history.** If a schema mismatch happens, stop and report. Use a NULL-safe migration only after explicit owner approval.
+- **DRY_RUN mode**: Always set `DRY_RUN=true` and `BE_FORCE_DRY_RUN=true` in `.env` to prevent any live order submission. The `.env` file is gitignored. **Never flip `DRY_RUN=false`. Never call `/api/bot/start`. Never connect IBKR or Gateway unless explicitly instructed.**
 - **IB Gateway** (Docker): Optional for dev. The bot runs in dry-run mode without it. Only needed for live/paper trading with IBKR.
 
 ### Testing
