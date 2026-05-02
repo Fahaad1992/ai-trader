@@ -34,63 +34,45 @@ export default function TradesPage() {
           <p className="text-sm text-muted-foreground mt-1">تظهر الصفقات هنا عندما يفتح البوت مراكز جديدة</p>
         </div>
       ) : (
-        <div className="space-y-4">
-          {trades.map(t => (
-            <div key={t.id} className="bg-card border border-border rounded-xl p-5">
-              <div className="flex items-start justify-between flex-wrap gap-4">
-                <div className="space-y-3">
-                  <div className="flex items-center gap-3 flex-wrap">
-                    {t.tradeMode !== "futures" && (
-                      <span className={`px-2 py-0.5 rounded text-sm font-medium ${t.contractType === 'call' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>{t.contractType === 'call' ? 'شراء' : 'بيع'}</span>
-                    )}
-                    <span className="text-lg font-bold">{t.underlying}</span>
-                    <span className="px-2 py-0.5 rounded text-xs bg-secondary text-muted-foreground">{strategyAr[t.strategy] ?? t.strategy}</span>
-                    <span className="px-2 py-0.5 rounded text-xs bg-secondary/50 text-muted-foreground">{t.mode === 'paper' ? 'ورقي' : 'حقيقي'}</span>
-                    {t.dataSource && (
-                      <span className="px-2 py-0.5 rounded text-xs bg-green-500/10 text-green-400">بيانات حقيقية</span>
-                    )}
+        <div className="space-y-3">
+          {trades.map(t => {
+            const isSPX = t.tradeMode === "spx_options";
+            const typeLabel = isSPX
+              ? (t.contractType === "call" ? "SPX CALL طلوع" : "SPX PUT نزول")
+              : t.contractType === "call" ? "CALL" : t.contractType === "put" ? "PUT" : t.underlying;
+            const typeBg = t.contractType === "call" ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400";
+            return (
+              <div key={t.id} className="bg-card border border-border rounded-xl p-4 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`px-2 py-0.5 rounded text-sm font-bold ${typeBg}`}>{typeLabel}</span>
+                    {!isSPX && <span className="text-sm font-bold">{t.underlying}</span>}
                   </div>
-                  {t.tradeMode !== "futures" && t.optionTicker && (
-                    <p className="text-xs text-muted-foreground font-mono ltr-nums">{t.optionTicker}</p>
-                  )}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-                    {t.tradeMode !== "futures" && <div><p className="text-muted-foreground text-xs">سعر التنفيذ</p><p className="font-medium ltr-nums">${t.strike}</p></div>}
-                    <div><p className="text-muted-foreground text-xs">سعر الدخول</p><p className="font-medium ltr-nums">${t.entryPremium.toFixed(2)}</p></div>
-                    <div><p className="text-muted-foreground text-xs">السعر الحالي</p><p className={`font-medium ltr-nums ${pnlColor(t.currentPremium - t.entryPremium)}`}>${t.currentPremium.toFixed(2)}</p></div>
-                    <div><p className="text-muted-foreground text-xs">الكمية</p><p className="font-medium ltr-nums">x{t.quantity}</p></div>
-                  </div>
-                  {t.tradeMode !== "futures" && (
-                    <>
-                      <div className="grid grid-cols-3 sm:grid-cols-6 gap-3 text-sm">
-                        <div><p className="text-muted-foreground text-xs">دلتا</p><p className="font-medium text-blue-400 ltr-nums">{t.delta?.toFixed(3) ?? '-'}</p></div>
-                        <div><p className="text-muted-foreground text-xs">جاما</p><p className="font-medium ltr-nums">{t.gamma?.toFixed(4) ?? '-'}</p></div>
-                        <div><p className="text-muted-foreground text-xs">ثيتا</p><p className="font-medium text-red-400 ltr-nums">{t.theta?.toFixed(2) ?? '-'}</p></div>
-                        <div><p className="text-muted-foreground text-xs">فيجا</p><p className="font-medium ltr-nums">{t.vega?.toFixed(2) ?? '-'}</p></div>
-                        <div><p className="text-muted-foreground text-xs">التقلب الضمني</p><p className="font-medium ltr-nums">{t.iv ? `${(t.iv * 100).toFixed(1)}%` : '-'}</p></div>
-                        <div><p className="text-muted-foreground text-xs">الانتهاء</p><p className="font-medium ltr-nums">{t.expiry}</p></div>
-                      </div>
-                      {(t.volume || t.openInterest) && (
-                        <div className="flex items-center gap-4 text-xs text-muted-foreground ltr-nums">
-                          {t.volume ? <span>الحجم: <span className="text-foreground font-medium">{t.volume.toLocaleString()}</span></span> : null}
-                          {t.openInterest ? <span>العقود المفتوحة: <span className="text-foreground font-medium">{t.openInterest.toLocaleString()}</span></span> : null}
-                          <span>وقت الفتح: {new Date(t.openedAt).toLocaleTimeString('ar-SA')}</span>
-                        </div>
-                      )}
-                    </>
-                  )}
+                  <p className={`text-xl font-bold ltr-nums ${pnlColor(t.pnl)}`}>{t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}</p>
                 </div>
-                <div className="text-left space-y-3">
-                  <div>
-                    <p className={`text-2xl font-bold ltr-nums ${pnlColor(t.pnl)}`}>{t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}</p>
-                    <p className={`text-sm ltr-nums ${pnlColor(t.pnlPercent)}`}>{t.pnlPercent >= 0 ? '+' : ''}{t.pnlPercent.toFixed(1)}%</p>
+
+                <div className="flex items-center gap-4 text-sm ltr-nums">
+                  <span>دخول <b>${t.entryPremium.toFixed(2)}</b></span>
+                  <span>حالي <b className={pnlColor(t.currentPremium - t.entryPremium)}>${t.currentPremium.toFixed(2)}</b></span>
+                  <span>وقف <b className="text-red-400">${t.trailingStopPrice?.toFixed(2) ?? t.initialStopPrice?.toFixed(2) ?? "—"}</b></span>
+                </div>
+
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-3 text-xs text-muted-foreground ltr-nums flex-wrap">
+                    {t.strike && <span>Strike ${t.strike}</span>}
+                    {t.expiry && <span>{t.expiry}</span>}
+                    {t.delta && <span>Δ{t.delta.toFixed(2)}</span>}
+                    <span>x{t.quantity}</span>
                   </div>
-                  <button onClick={() => handleClose(t.id, t.currentPremium)} className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm">
-                    <X className="h-3 w-3" /> إغلاق
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => handleClose(t.id, t.currentPremium)} className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-medium">
+                      <X className="h-3 w-3" /> إغلاق
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

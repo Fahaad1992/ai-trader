@@ -8,8 +8,9 @@ import { market, isMarketOpen, getMarketStatus, type OptionQuote, type StockData
 import { ibkr } from "./ibkr-client.js";
 import { saveTrade, closeTrade as dbCloseTrade, loadOpenTrades, loadAllTrades, saveLog, saveDailyStats, loadLogs, loadErrorLogs, loadLogsSince } from "./database.js";
 import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
-import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat } from "./notify.js";
+import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat, notifySPXEntry, notifySPXStopUpdate, notifySPXClose } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
+import { roundSPXStop, roundSPXEntry } from "./spx-tick.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
 import { isProtectionReady, classifySilentFailure } from "./live-safety";
 import {
@@ -301,19 +302,20 @@ type AssetStopProfile = {
 const INDEX_STOP_UNDERLYINGS = new Set(["SPX", "NDX", "QQQ"]);
 const SINGLE_STOCK_STOP_UNDERLYINGS = new Set(["NVDA", "TSLA", "AMZN"]);
 
-// ========== SPX OPTIONS DRY_RUN PARAMETERS ==========
-const SPX_INITIAL_STOP_PERCENT = 0.25;
-const SPX_TARGET_PERCENT = 0.35;
-const SPX_TRAILING_ACTIVATE_PERCENT = 0.20;
-const SPX_TRAILING_DISTANCE_PERCENT = 0.12;
-const SPX_BREAKEVEN_TRIGGER_PERCENT = 0.15;
-const SPX_BREAKEVEN_LOCK_PERCENT = 0.03;
+// ========== SPX OPTIONS DRY_RUN PARAMETERS (owner-approved) ==========
+const SPX_INITIAL_STOP_PERCENT = 0.40;
 const SPX_MAX_CONTRACTS = 1;
-const SPX_MAX_PREMIUM = 25.00;
+const SPX_MAX_PREMIUM = 5.00;
 const SPX_MAX_SPREAD = 0.50;
 const SPX_DELTA_MIN = 0.35;
 const SPX_DELTA_MAX = 0.60;
 const SPX_UNDERLYING = "SPX";
+// Stop upgrade thresholds (premium % above entry that triggers each stage)
+const SPX_BE_TRIGGER_PERCENT = 0.06;
+const SPX_BE_LOCK_PERCENT = 0.04;
+const SPX_PROFIT_LOCK_TRIGGER_PERCENT = 0.10;
+const SPX_TRAILING_ACTIVATE_PERCENT = 0.20;
+const SPX_TRAILING_DISTANCE_PERCENT = 0.15;
 // ========== END SPX OPTIONS PARAMETERS ==========
 
 function roundOptionPrice(value: number): number {
@@ -360,18 +362,32 @@ function getAssetStopProfile(underlying: string): AssetStopProfile {
 }
 
 function getSPXPremiumStop(entryPremium: number): number {
-  return roundOptionPrice(entryPremium * (1 - SPX_INITIAL_STOP_PERCENT));
-}
-
-function getSPXPremiumTarget(entryPremium: number): number {
-  return roundOptionPrice(entryPremium * (1 + SPX_TARGET_PERCENT));
+  return roundSPXStop(entryPremium * (1 - SPX_INITIAL_STOP_PERCENT));
 }
 
 function getSPXTrailingConfig(entryPremium: number): TrailingConfig {
   return {
-    activation: roundOptionPrice(entryPremium * SPX_TRAILING_ACTIVATE_PERCENT),
-    distance: roundOptionPrice(entryPremium * SPX_TRAILING_DISTANCE_PERCENT),
+    activation: roundSPXStop(entryPremium * SPX_TRAILING_ACTIVATE_PERCENT),
+    distance: roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PERCENT),
   };
+}
+
+function getSPXStopUpgrade(entryPremium: number, currentPremium: number, currentStop: number): { newStop: number; stage: string } | null {
+  const profitPct = (currentPremium - entryPremium) / entryPremium;
+  if (profitPct >= SPX_TRAILING_ACTIVATE_PERCENT) {
+    const trailDist = roundSPXStop(entryPremium * SPX_TRAILING_DISTANCE_PERCENT);
+    const candidate = roundSPXStop(currentPremium - trailDist);
+    if (candidate > currentStop) return { newStop: candidate, stage: "TRAILING" };
+  }
+  if (profitPct >= SPX_PROFIT_LOCK_TRIGGER_PERCENT) {
+    const lockAt = roundSPXStop(entryPremium + (currentPremium - entryPremium) * 0.50);
+    if (lockAt > currentStop) return { newStop: lockAt, stage: "PROFIT_LOCK" };
+  }
+  if (profitPct >= SPX_BE_TRIGGER_PERCENT) {
+    const beLock = roundSPXStop(entryPremium * (1 + SPX_BE_LOCK_PERCENT));
+    if (beLock > currentStop) return { newStop: beLock, stage: "BREAKEVEN" };
+  }
+  return null;
 }
 
 export function getTrailingConfig(underlying: string, _entryPremium?: number): TrailingConfig {
@@ -1904,7 +1920,7 @@ export class TradingEngine {
 
     const premium = opt.ask;
     if (premium > SPX_MAX_PREMIUM) {
-      return this.rejectOptionQuality(underlying, ct, opt, `SPX_MAX_PREMIUM_CAP: $${premium.toFixed(2)} > $${SPX_MAX_PREMIUM}`, "spx_max_premium_cap");
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_PREMIUM_ABOVE_OWNER_LIMIT: $${premium.toFixed(2)} > $${SPX_MAX_PREMIUM}`, "spx_premium_above_owner_limit");
     }
 
     const spread = opt.ask - opt.bid;
@@ -1918,8 +1934,8 @@ export class TradingEngine {
     }
 
     const dataAge = Date.now() - (opt.timestamp || 0);
-    if (dataAge > 120_000) {
-      return this.rejectOptionQuality(underlying, ct, opt, `SPX_DATA_STALE: data age ${Math.round(dataAge / 1000)}s > 120s`, "spx_data_stale");
+    if (!Number.isFinite(opt.timestamp) || opt.timestamp === 0) {
+      return this.rejectOptionQuality(underlying, ct, opt, `SPX_REALTIME_DATA_REQUIRED: no timestamp on quote`, "spx_realtime_data_required");
     }
 
     const spreadPct = opt.mid > 0 ? (spread / opt.mid) * 100 : 999;
@@ -1958,14 +1974,13 @@ export class TradingEngine {
       return;
     }
 
-    const fillPrice = opt.ask;
+    const fillPrice = roundSPXEntry(opt.ask);
     const stopPremium = getSPXPremiumStop(fillPrice);
-    const targetPremium = getSPXPremiumTarget(fillPrice);
     const tConfig = getSPXTrailingConfig(fillPrice);
-    const breakEvenTrigger = roundOptionPrice(fillPrice * (1 + SPX_BREAKEVEN_TRIGGER_PERCENT));
-    const breakEvenLock = roundOptionPrice(fillPrice * (1 + SPX_BREAKEVEN_LOCK_PERCENT));
+    const beTrigger = roundSPXStop(fillPrice * (1 + SPX_BE_TRIGGER_PERCENT));
+    const beLock = roundSPXStop(fillPrice * (1 + SPX_BE_LOCK_PERCENT));
 
-    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | target:$${targetPremium.toFixed(2)} (+${(SPX_TARGET_PERCENT * 100).toFixed(0)}%) | trailing activate:$${tConfig.activation.toFixed(2)} distance:$${tConfig.distance.toFixed(2)} | BE trigger:$${breakEvenTrigger.toFixed(2)} lock:$${breakEvenLock.toFixed(2)} | contracts:${orderQuantity}`, {
+    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE_PERCENT * 100).toFixed(0)}% | contracts:${orderQuantity}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
     });
 
@@ -1985,7 +2000,7 @@ export class TradingEngine {
       trailingStopPrice: stopPremium,
       trailingConfig: tConfig,
       initialStopPrice: stopPremium,
-      breakEvenTriggerPrice: breakEvenTrigger,
+      breakEvenTriggerPrice: beTrigger,
       breakEvenStopMoved: false,
       effectiveStopPrice: stopPremium,
       openedAt: Date.now(), status: "open",
@@ -2010,7 +2025,7 @@ export class TradingEngine {
         sec_type: "OPT" as any,
         contract_month: null as any,
         stop_price: stopPremium as any,
-        target_price: targetPremium as any,
+        target_price: null as any,
         signal_id: ((gate as any)?.signalId ?? null) as any,
         confidence: (gate?.confidence ?? null) as any,
         confirmations_passed: conf.filter(c => c.passed).length as any,
@@ -2027,21 +2042,13 @@ export class TradingEngine {
     }
 
     try {
-      notifyTradeEntry(
-        underlying, opt.expiry, opt.strike, ct.toUpperCase(),
-        orderQuantity, fillPrice, stopPremium, targetPremium,
-        gate.confidence ?? 0, [], [], t.openedAt,
-        {
-          signalScore: gate.signal, rawScore: gate.rawScore ?? null,
-          requestedSize: gate.requestedSize ?? orderQuantity, finalSize: orderQuantity,
-          reductionReason: null, orderType: "SPX_DRY_RUN_SIMULATED",
-        },
-      );
+      notifySPXEntry(ct, opt.strike, opt.expiry, fillPrice, stopPremium,
+        conf.filter(c => c.passed).length, conf.length, gate.confidence ?? 0);
     } catch (e: any) {
       this.log("error", `[SPX_TELEGRAM_ERROR] ${e.message}`);
     }
 
-    this.log("trade", `[SPX_TRADE_OPEN] 🟢 SPX OPTION ${ct.toUpperCase()} | Strike:$${opt.strike} | Exp:${opt.expiry} | Entry:$${fillPrice.toFixed(2)} | Stop:$${stopPremium.toFixed(2)} | Target:$${targetPremium.toFixed(2)} | Δ${Math.abs(opt.delta).toFixed(3)} | Spread:$${spread.toFixed(2)} | Contracts:${orderQuantity} | DRY_RUN`, {
+    this.log("trade", `[SPX_TRADE_OPEN] 🟢 SPX OPTION ${ct.toUpperCase()} | Strike:$${opt.strike} | Exp:${opt.expiry} | Entry:$${fillPrice.toFixed(2)} | Stop:$${stopPremium.toFixed(2)} | Δ${Math.abs(opt.delta).toFixed(3)} | Spread:$${spread.toFixed(2)} | Contracts:${orderQuantity} | DRY_RUN`, {
       tradeId: t.id, symbol: underlying, underlying, optionSide: ct.toUpperCase(),
       bid: opt.bid, ask: opt.ask, premium: fillPrice,
       contractDetails: this.formatContractDetails(opt, s, fillPrice),
