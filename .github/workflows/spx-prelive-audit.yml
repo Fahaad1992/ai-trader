@@ -19,9 +19,13 @@ jobs:
       - name: Install dependencies (no native script execution)
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: SPX CALL PUT scope and stop safety tests
-        run: npx vitest run server/trading/spx-execution-scope.test.ts server/trading/spx-option-tick-quality.test.ts server/trading/broker-exposure-guard.test.ts server/options/premium-stop-ladder.test.ts server/options/stop-recovery.test.ts server/options/paper-event-engine.test.ts shared/spx-premium-risk.test.ts
+        run: npx vitest run server/trading/spx-execution-scope.test.ts server/trading/spx-option-tick-quality.test.ts server/trading/live-safety.test.ts server/trading/broker-exposure-guard.test.ts server/options/premium-stop-ladder.test.ts server/options/stop-recovery.test.ts server/options/paper-event-engine.test.ts shared/spx-premium-risk.test.ts
       - name: Compile production bundle WITHOUT launching bot
         run: npm run build
       - name: Existing TypeScript code diagnostics
         continue-on-error: true
         run: npx tsc --noEmit
+
+      - name: Full project test suite (report-only, includes inherited test failures)
+        continue-on-error: true
+        run: npx vitest run
