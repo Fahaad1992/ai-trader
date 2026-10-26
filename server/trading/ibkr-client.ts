@@ -925,7 +925,11 @@ class IBKRClient {
       };
       const maybeResolve = () => {
         const priceData = this.stockPrices.get(`OPT_${reqId}`);
-        if (!priceData || !greeks || !Number.isFinite(greeks.delta) || greeks.delta === 0) return;
+        // Do not return immediately on Greeks + quote if the IBKR option
+        // trading-volume tick hasn't arrived yet; a fake zero-volume snapshot
+        // would make every otherwise-valid contract fail the liquidity guard.
+        if (!priceData || !greeks || !Number.isFinite(greeks.delta) || greeks.delta === 0 ||
+            !Number.isFinite(priceData.volume) || priceData.volume <= 0) return;
         const verdict = verifySPXOptionTick({
           bid: priceData.bid, ask: priceData.ask,
           bidReceivedAtMs: priceData.bidReceivedAtMs,
