@@ -25,12 +25,9 @@ export interface ProtectionCheckResult {
 }
 
 // Accepted order-states for a child that is live and protecting the position.
-const ACCEPTED_CHILD_STATES = new Set([
-  "PreSubmitted",
-  "Submitted",
-  "Filled",
-  "PendingSubmit",
-]);
+// A pending acceptance is not broker-side protection. A filled stop is
+// an execution/exit, not a working protective order.
+const ACCEPTED_CHILD_STATES = new Set(["PreSubmitted", "Submitted"]);
 
 // Statuses that unequivocally mean the order is dead.
 const DEAD_PARENT_STATES = new Set([
@@ -61,7 +58,7 @@ export function isProtectionReady(
   }
 
   // Parent-side checks
-  if (typeof r.orderId !== "number") {
+  if (!Number.isSafeInteger(r.orderId) || (r.orderId ?? 0) <= 0) {
     reasons.push("NO_PARENT_ORDER_ID");
   }
   const parentStatus = r.parentStatus || r.status || "";
@@ -73,7 +70,7 @@ export function isProtectionReady(
   }
 
   // Stop child — mandatory
-  if (typeof r.stopOrderId !== "number") {
+  if (!Number.isSafeInteger(r.stopOrderId) || (r.stopOrderId ?? 0) <= 0) {
     reasons.push("NO_STOP_ORDER_ID");
   }
   const stopState = r.childStopStatus || "";
@@ -83,7 +80,7 @@ export function isProtectionReady(
 
   // Target child — only required if caller requested 3-leg bracket
   if (expectTarget) {
-    if (typeof r.targetOrderId !== "number") {
+    if (!Number.isSafeInteger(r.targetOrderId) || (r.targetOrderId ?? 0) <= 0) {
       reasons.push("NO_TARGET_ORDER_ID");
     }
     const targetState = r.childTargetStatus || "";
