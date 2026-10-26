@@ -13,6 +13,7 @@ import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat, notifySPXEntry, notifySPXStopUpdate, notifySPXClose } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
 import { roundSPXStop, roundSPXEntry } from "./spx-tick.js";
+import { resolveLongSPXOptionFromTrend } from "./spx-execution-scope.js";
 import { SPX_INITIAL_STOP_LOSS_FRACTION, getSPXInitialPremiumStopRaw } from "../../shared/spx-premium-risk.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
 import { isProtectionReady, classifySilentFailure } from "./live-safety";
@@ -821,7 +822,10 @@ export class TradingEngine {
   }
   async start() {
     if (this.running) return;
-    if (isFuturesMode()) this.logTradeModeGuard("engine start");
+    if (!isSPXOptionsMode()) {
+      this.log("error", "[SPX_ONLY_START_BLOCKED] TRADE_MODE must be spx_options; MES, futures and other symbols forbidden");
+      return;
+    }
 
     if (!market.isConfigured()) {
       this.log("error", "لا يمكن التشغيل: مفتاح API غير موجود");
@@ -1412,11 +1416,20 @@ export class TradingEngine {
           const sizeOverride = Math.max(0, Math.min(1, Number(decision.size_override ?? (decision.decision === "EXECUTE" || decision.decision === "REDUCE" ? 1 : 0))));
           const finalSize = (decision.decision === "EXECUTE" || decision.decision === "REDUCE") ? Math.min(sizeOverride, requestedSize, 1) : 0;
           const trendConf = r.confirmations.find(c => c.name === "trend");
-          const optionSide: BotOptionSide | undefined = trendConf?.value?.includes("صاعد") ? "CALL" : "PUT";
+          const spxLongRight = isSPXOptionsMode() ? resolveLongSPXOptionFromTrend(trendConf ?? null) : null;
+          if (isSPXOptionsMode() && !spxLongRight) {
+            this.log("warn", "[SPX_ENTRY_BLOCKED_TREND_UNKNOWN] Neither confirmed CALL nor confirmed PUT. No new position.");
+            continue;
+          }
+          const optionSide: BotOptionSide | undefined = isSPXOptionsMode()
+            ? (spxLongRight === "call" ? "CALL" : "PUT")
+            : trendConf?.value?.includes("صاعد") ? "CALL" : "PUT";
           // ===== BIDIRECTIONAL TRADE SIDE (DRY_RUN-only SHORT) =====
           // LONG = CALL (uptrend). SHORT = PUT (downtrend).
           // SHORT entries are simulated ONLY in DRY_RUN. Live SHORT is hard-blocked.
-          const tradeSide: "LONG" | "SHORT" = optionSide === "CALL" ? "LONG" : "SHORT";
+          const tradeSide: "LONG" | "SHORT" = isSPXOptionsMode()
+            ? "LONG" // Both CALL and PUT are BUY_TO_OPEN. Never naked SHORT.
+            : optionSide === "CALL" ? "LONG" : "SHORT";
           const ENGINE_DRY_RUN = true; // mirror of inner DRY_RUN flag; do not flip without owner approval
           if (isFuturesMode() && tradeSide === "SHORT") {
             if (!ENGINE_DRY_RUN) {
@@ -2047,7 +2060,11 @@ export class TradingEngine {
   private async validateSPXOptionForEntry(conf: Confirmation[]): Promise<OptionQuote | null> {
     const underlying = SPX_UNDERLYING;
     const trendConf = conf.find(c => c.name === "trend");
-    const ct: "call" | "put" = trendConf?.value?.includes("صاعد") ? "call" : "put";
+    const ct = resolveLongSPXOptionFromTrend(trendConf ?? null);
+    if (!ct) {
+      this.log("error", "[SPX_LONG_OPTION_DIRECTION_UNVERIFIED] Block CALL/PUT entry");
+      return null;
+    }
 
     this.log("info", `[SPX_OPTION_VALIDATE] جاري البحث عن ${ct.toUpperCase()} لـ ${underlying} | Delta:${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | MaxPremium:$${SPX_MAX_PREMIUM} | MaxSpread:$${SPX_MAX_SPREAD}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
@@ -2126,7 +2143,11 @@ export class TradingEngine {
     const underlying = SPX_UNDERLYING;
     const s = this.config.activeStrategy as Strategy;
     const trendConf = conf.find(c => c.name === "trend");
-    const ct: ContractType = trendConf?.value?.includes("صاعد") ? "call" : "put";
+    const ct = resolveLongSPXOptionFromTrend(trendConf ?? null);
+    if (!ct) {
+      this.log("error", "[SPX_LONG_OPTION_DIRECTION_UNVERIFIED] Do not choose PUT by default");
+      return;
+    }
     const signal = `${underlying}:${conf.filter(c => c.passed).length}/8`;
     const trace: ExecutionTrace = executionTrace ?? { signalDetectedAt: Date.now() };
 
