@@ -38,3 +38,13 @@ Above $4.00, this **preview** uses a provisional, configurable additional $0.50 
 `npx vitest run server/options/premium-stop-ladder.test.ts`
 
 The file remains completely disconnected from the existing engine until separate integration tests demonstrate its operational safety. **Do not disable DRY_RUN, modify .env, restart IB Gateway, or deploy live execution based on this preview.**
+
+## Autonomous paper path — added in this branch
+
+- `autonomous-entry-guard.ts`: rejects entries without verified timely SPX live option bid/ask, contract, session, positive broker stop readiness, sufficient buying power, acceptable spread, no open exposure, risk limits and a separately confirmed signal.
+- `paper-event-engine.ts`: pure event-driven reducer for paper simulated entry at ASK, stop amendments on every incoming quote, and simulated exit at available BID (may gap below stop). It never connects to a broker.
+- Unit-test files for those two modules were added. Tests are **not yet run against this GitHub branch's full environment**; no CI status has been verified.
+
+**Important speed limitation found in deployed-source logic:** legacy `server/trading/engine.ts` schedules entry scans at 90 seconds and position reprice checks at 30 seconds. That is too slow for the user's SPX objective. The isolated paper reducer does not use those timers, but it is **not yet wired to an actual real-time quote subscription, persistent execution service, or broker order amendment**. Nothing here claims sub-second execution or always-on monitoring.
+
+Do not connect live orders until the complete end-to-end paper tests pass with actual exchange quotes, validated option tick sizes and broker-side stops. Existing scoring in `decision-engine.ts` uses an approximate market clock and a volume proxy, so it is **not an acceptable source of verified autonomous entry** without independent market-session/news/volume safeguards.
