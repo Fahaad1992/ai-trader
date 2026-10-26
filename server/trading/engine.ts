@@ -1146,7 +1146,7 @@ export class TradingEngine {
       this.logTradeModeGuard("open trade option pricing");
       return;
     }
-    for (const t of this.getOpenTrades()) {
+    for (const t of this.trades.filter(t => t.status === "open")) {
       try {
         const updated = await market.getOptionPrice(t.underlying, t.contractType, t.strike, t.expiry);
         if (updated) {
@@ -1172,6 +1172,12 @@ export class TradingEngine {
 
   // ========== PAPER TRAILING STOP WITH BROKER-SIDE PROTECTION ==========
   private async syncBrokerStop(trade: Trade, newStopPrice: number, trigger: string): Promise<boolean> {
+    if (isSPXOptionsMode()) {
+      // Legacy update creates a NEW stop and cancels the original. That can
+      // duplicate an existing stop after reconnect. Never use for SPX.
+      this.log("error", "[SPX_STOP_AMENDMENT_NOT_VERIFIED] No same-order-ID broker ACK adapter. Existing stop stays unchanged.");
+      return false;
+    }
     const oldStopPrice = trade.trailingStopPrice;
     const oldStopOrderId = this.ibkrStopOrderIds.get(trade.id);
     if (!market.isIBKRConnected()) {
@@ -3075,6 +3081,11 @@ export class TradingEngine {
   }
 
   private async closeTrade(t: Trade, reason: Trade["closeReason"]) {
+    if (isSPXOptionsMode() && t.dataSource === "ibkr-live") {
+      this.log("error", "[SPX_LIVE_CLOSE_ADAPTER_NOT_VERIFIED] Never cancel a live broker stop or mark a live position closed before confirmed broker fill");
+      try { notifyCriticalError("SPX LIVE CLOSE BLOCKED", "Broker closing / OCA reconciliation adapter is not yet verified. Inspect IBKR position."); } catch {}
+      return;
+    }
     const linkedStopOrderId = this.ibkrStopOrderIds.get(t.id);
     if (linkedStopOrderId && market.isIBKRConnected()) {
       try {
@@ -3259,6 +3270,12 @@ export class TradingEngine {
   }
 
   async closeById(id: string, cp?: number) {
+    if (isSPXOptionsMode()) {
+      // This old UI path CANCELS the protective stop before broker position
+      // close confirmation, leaving exposure unprotected. Block it.
+      this.log("error", "[SPX_MANUAL_CLOSE_UNSAFE] Refuse local-only close; use verified IBKR position close");
+      return;
+    }
     if (isFuturesMode()) {
       this.logTradeModeGuard("manual option close");
       return;
