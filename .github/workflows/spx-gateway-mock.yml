@@ -1,0 +1,26 @@
+name: SPX Gateway mock and disconnect regression
+on:
+  push:
+    branches:
+      - chatgpt/spx-gateway-simulation-20261026
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Mock Gateway market-data and stop recovery tests
+        run: npx vitest run server/trading/ibkr-option-snapshot.mock.test.ts server/options/stop-recovery.test.ts server/trading/broker-exposure-guard.test.ts server/trading/spx-contract-selection.test.ts server/trading/spx-option-tick-quality.test.ts server/trading/live-safety.test.ts
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Production build without launching bot
+        run: npm run build
