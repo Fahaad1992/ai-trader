@@ -2,7 +2,7 @@
  * IBKR Client - Connects to IB Gateway via TWS API
  * Uses @stoqey/ib library for real-time market data and order execution
  */
-import IB from "ib";
+import { IBApi as StoqeyIBApi } from "@stoqey/ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
 import { verifySPXOptionTick } from "./spx-option-tick-quality.js";
 import { checkLongSPXOrderScope } from "./spx-execution-scope.js";
@@ -112,7 +112,7 @@ function removeListenerSafe(target: any, event: string, listener: (...args: any[
 }
 
 function createIbClient(options: { host: string; port: number; clientId: number }): IBApi {
-  return new (IB as any)(options);
+  return new StoqeyIBApi(options);
 }
 
 const IBKR_HOST = process.env.IBKR_HOST || "127.0.0.1";
@@ -355,10 +355,14 @@ class IBKRClient {
           finalize(false);
         });
 
-        client.on(EventName.error, (err: Error, data?: { id?: number; code?: number }) => {
+        client.on(EventName.error, (err: Error, codeOrData?: number | { id?: number; code?: number }, idArg?: number) => {
           if (this.ib !== client) return;
-          const code = Number(data?.code ?? -1);
-          const reqId = Number(data?.id ?? -1);
+          // @stoqey/ib emits (Error, errorCode, requestId). Legacy clients
+          // may emit (Error, {code,id}); support both without swallowing 1100.
+          const code = typeof codeOrData === "number"
+            ? codeOrData : Number(codeOrData?.code ?? -1);
+          const reqId = typeof codeOrData === "number"
+            ? Number(idArg ?? -1) : Number(codeOrData?.id ?? -1);
           const errorMessage = err?.message || String(err);
           const msg = `[IBKR] Error: ${errorMessage} (code: ${code}, reqId: ${reqId})`;
           if (code === 1100 || code === 2110 || code === 1300) {
