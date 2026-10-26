@@ -6,7 +6,9 @@
 import type { Trade, BotConfig, BotStatus, BotLog, DailyStats, OverallStats, DailyHistory, Confirmation, Strategy, ContractType, TrailingConfig, SmartBrainStatsReport, DecisionStatsWindow, BotDecision, BotOptionSide } from "../../shared/types.js";
 import { market, isMarketOpen, getMarketStatus, type OptionQuote, type StockData } from "./market-data.js";
 import { ibkr } from "./ibkr-client.js";
-import { saveTrade, closeTrade as dbCloseTrade, loadOpenTrades, loadAllTrades, saveLog, saveDailyStats, loadLogs, loadErrorLogs, loadLogsSince } from "./database.js";
+import { saveTrade, closeTrade as dbCloseTrade, loadOpenTrades, loadAllTrades, saveLog, saveDailyStats, loadLogs, loadErrorLogs, loadLogsSince, loadSavedSPXStop } from "./database.js";
+import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
+import { reconcileSPXStop, type RecoveredSPXStop, type RecoveryBrokerSnapshot } from "../options/stop-recovery.js";
 import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat, notifySPXEntry, notifySPXStopUpdate, notifySPXClose } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
@@ -486,6 +488,7 @@ export class TradingEngine {
   private brokerRecoveryAttempts = 0;
   private brokerNextRecoveryAt = 0;
   private ibkrStopOrderIds = new Map<string, number>();
+  private recoveredSPXStop: RecoveredSPXStop | null = null;
   private lastExitReason: string | null = null;
   private lastExitPnl: number = 0;
   private reEntryBlockedReason: string | null = null;
@@ -857,6 +860,7 @@ export class TradingEngine {
       // before a crash. Never assume absence from local DB means no exposure.
       try {
         const brokerExposure = await ibkr.getBrokerExposureSnapshot();
+        this.auditSPXRecoveredStop(brokerExposure);
         if (!brokerExposure) {
           this.log("error", "[IBKR_RESTART_RECONCILIATION_UNKNOWN] Broker position/order snapshot unavailable. New live options orders are blocked at broker entry gate.");
           try { notifyCriticalError("IBKR recovery", "Could not verify broker positions/orders after restart. No new option entry until IBKR reconciliation succeeds."); } catch {}
@@ -960,6 +964,52 @@ export class TradingEngine {
    * sending, modifying, or cancelling orders automatically.
    * Re-entry is broker-guarded, and stale/ambiguous recovery stays blocked.
    */
+  /**
+   * Startup/reconnect reconciliation is READ ONLY. Never cancel, replace or
+   * reissue a protective order merely because a process was restarted.
+   * Saved order identity must exactly match the broker's live stop.
+   */
+  private auditSPXRecoveredStop(exposure: BrokerExposureSnapshot | null): void {
+    if (!isSPXOptionsMode()) return;
+    const accountId = market.getIBKRAccountId();
+    try {
+      const saved = loadSavedSPXStop(accountId);
+      const broker: RecoveryBrokerSnapshot | null = exposure ? {
+        connected: market.isIBKRConnected(),
+        completed: exposure.completed,
+        accountId: exposure.accountId,
+        retrievedAtMs: exposure.fetchedAtMs,
+        positions: exposure.positions.map(p => ({
+          accountId: p.account, conId: p.conId, symbol: p.symbol,
+          secType: p.secType ?? "", quantity: p.quantity,
+          right: p.right, expiry: p.expiry, strike: p.strike,
+        })),
+        orders: exposure.openOrders.map(o => ({
+          orderId: o.orderId, permId: o.permId, conId: o.conId,
+          symbol: o.symbol, secType: o.secType ?? "", action: o.action ?? "",
+          orderType: o.orderType ?? "", status: o.status,
+          auxPrice: o.auxPrice, parentId: o.parentId,
+          totalQuantity: o.totalQuantity ?? NaN,
+        })),
+      } : null;
+      const result = reconcileSPXStop(saved, broker, String(process.env.IBKR_REQUIRED_ACCOUNT_ID || ""), Date.now());
+      if (result.status === "RESUME_MONITORING") {
+        this.recoveredSPXStop = result.recovered;
+        this.log("info", `[SPX_STOP_RECOVERED_VERIFIED] brokerConId=${result.recovered.saved.conId} stopOrderId=${result.recovered.activeStopOrderId} confirmedStop=${result.recovered.stopPriceAtBroker} peakBid=${result.recovered.stopState.peakBid} | read-only until execution adapter is proven`);
+      } else if (result.status === "FLAT") {
+        this.recoveredSPXStop = null;
+        this.log("info", "[SPX_RECOVERY_VERIFIED_FLAT] No saved trade, broker positions or orders");
+      } else {
+        this.recoveredSPXStop = null;
+        this.log("error", `[SPX_STOP_RECOVERY_BLOCKED] reason=${result.reason}; do not create duplicate entry/stop or fabricate tracking`);
+        try { notifyCriticalError("SPX STOP RECOVERY BLOCKED", result.reason + ". Check the position and confirmed broker-side protective order."); } catch {}
+      }
+    } catch (error: any) {
+      this.recoveredSPXStop = null;
+      this.log("error", `[SPX_STOP_RECOVERY_FAILED] ${error?.message || error}. New option entries remain protected by broker exposure gate.`);
+    }
+  }
+
   private async superviseBrokerConnection(): Promise<void> {
     if (!this.running || this.brokerRecoveryBusy) return;
     const connected = market.isIBKRConnected();
@@ -990,6 +1040,7 @@ export class TradingEngine {
       // Neither local DB nor the cached quote alone is enough to restore
       // confidence. Ask the broker to finish BOTH exposure enumerations.
       const exposure = await ibkr.getBrokerExposureSnapshot();
+      this.auditSPXRecoveredStop(exposure);
       if (!exposure || !exposure.completed || exposure.accountId !== configuredAccount) {
         throw new Error("BROKER_EXPOSURE_RECONCILIATION_INCOMPLETE");
       }
