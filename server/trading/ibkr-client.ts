@@ -159,6 +159,7 @@ export interface IBKRStockData {
   low: number;
   close: number;
   volume: number;
+  openInterest?: number;
   timestamp: number;
   bidReceivedAtMs?: number;
   askReceivedAtMs?: number;
@@ -528,9 +529,17 @@ class IBKRClient {
           const existing = this.stockPrices.get(ticker);
           if (!existing) return;
 
-          if (tickType === 8) {
+          // IBKR option generic tick 100: call/put volume (29/30).
+          // Generic 101: call/put open interest (27/28).
+          // Standard tick 8 carries volume for some feeds; do not assume all
+          // option contracts report their trading volume through type 8.
+          const optionTicker = ticker.startsWith("OPT_");
+          if (tickType === 8 || (optionTicker && (tickType === 29 || tickType === 30))) {
             existing.volume = size;
             existing.timestamp = Date.now();
+            this.stockPrices.set(ticker, existing);
+          } else if (optionTicker && (tickType === 27 || tickType === 28)) {
+            existing.openInterest = size;
             this.stockPrices.set(ticker, existing);
           }
         });
@@ -930,7 +939,7 @@ class IBKRClient {
           bid: verdict.bid, ask: verdict.ask,
           mid: (verdict.bid + verdict.ask) / 2,
           last: priceData.last || 0, volume: priceData.volume || 0,
-          openInterest: 0, delta: greeks.delta,
+          openInterest: priceData.openInterest || 0, delta: greeks.delta,
           gamma: greeks.gamma || 0, theta: greeks.theta || 0,
           vega: greeks.vega || 0, iv: greeks.iv || 0,
           timestamp: verdict.timestampMs, delayed: false,
