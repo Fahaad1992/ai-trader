@@ -481,6 +481,10 @@ export class TradingEngine {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private brokerAccountSnapshot: BrokerAccountSnapshot | null = null;
   private brokerAccountPollTimer: ReturnType<typeof setInterval> | null = null;
+  private brokerRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+  private brokerRecoveryBusy = false;
+  private brokerRecoveryAttempts = 0;
+  private brokerNextRecoveryAt = 0;
   private ibkrStopOrderIds = new Map<string, number>();
   private lastExitReason: string | null = null;
   private lastExitPnl: number = 0;
@@ -927,6 +931,10 @@ export class TradingEngine {
       }
     }
 
+    // A separate 5-second health supervisor detects dropped sockets even
+    // while the 90s signal scanner or 120s market refresh is idle.
+    this.brokerRecoveryTimer = setInterval(() => { void this.superviseBrokerConnection(); }, 5_000);
+    void this.superviseBrokerConnection();
     this.scanTimer = setInterval(() => this.parallelScan(), 90_000);
     this.refreshTimer = setInterval(() => this.refreshData(), 120_000);
     this.pnlTimer = setInterval(() => this.updateOpenTradePrices(), 30_000);
@@ -937,6 +945,7 @@ export class TradingEngine {
 
   stop() {
     this.running = false;
+    if (this.brokerRecoveryTimer) { clearInterval(this.brokerRecoveryTimer); this.brokerRecoveryTimer = null; }
     if (this.scanTimer) { clearInterval(this.scanTimer); this.scanTimer = null; }
     if (this.refreshTimer) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
     if (this.pnlTimer) { clearInterval(this.pnlTimer); this.pnlTimer = null; }
@@ -946,8 +955,82 @@ export class TradingEngine {
     try { notifyBotStopped("تم إيقاف البوت"); } catch {}
   }
 
+  /**
+   * Detect Gateway outages and re-establish subscriptions without ever
+   * sending, modifying, or cancelling orders automatically.
+   * Re-entry is broker-guarded, and stale/ambiguous recovery stays blocked.
+   */
+  private async superviseBrokerConnection(): Promise<void> {
+    if (!this.running || this.brokerRecoveryBusy) return;
+    const connected = market.isIBKRConnected();
+    if (connected && this.dataState === "connected") return;
+    if (!connected) {
+      this.dataState = "waiting";
+      if (!this.ibkrDisconnectAlerted) {
+        this.log("error", "[IBKR_GATEWAY_LOST] Connection lost; blocking new entries and keeping existing broker-side orders unchanged");
+        try { notifyIBKRDisconnect(); } catch {}
+        this.ibkrDisconnectAlerted = true;
+      }
+    }
+    if (Date.now() < this.brokerNextRecoveryAt) return;
+    this.brokerRecoveryBusy = true;
+    try {
+      if (!connected) {
+        this.brokerRecoveryAttempts++;
+        const ok = await market.connectIBKR();
+        if (!ok || !market.isIBKRConnected()) {
+          throw new Error("GATEWAY_RECONNECT_FAILED");
+        }
+      }
+      const connectedAccount = market.getIBKRAccountId();
+      const configuredAccount = String(process.env.IBKR_REQUIRED_ACCOUNT_ID || "");
+      if (!configuredAccount || connectedAccount !== configuredAccount) {
+        throw new Error("ACCOUNT_NOT_VERIFIED_AFTER_RECONNECT");
+      }
+      // Neither local DB nor the cached quote alone is enough to restore
+      // confidence. Ask the broker to finish BOTH exposure enumerations.
+      const exposure = await ibkr.getBrokerExposureSnapshot();
+      if (!exposure || !exposure.completed || exposure.accountId !== configuredAccount) {
+        throw new Error("BROKER_EXPOSURE_RECONCILIATION_INCOMPLETE");
+      }
+      if (exposure.positions.length || exposure.openOrders.length) {
+        this.log("warn", `[IBKR_RECOVERY_EXISTING_EXPOSURE] positions=${exposure.positions.length} openOrders=${exposure.openOrders.length}. No additional entry permitted.`);
+        if (exposure.positions.length > 0 && exposure.openOrders.length === 0) {
+          try { notifyCriticalError("IBKR POSSIBLY UNPROTECTED", "Broker holds a position but no working orders were visible after reconnect. Inspect protective orders urgently."); } catch {}
+        }
+      }
+      const loaded = await market.loadPrices();
+      if (!loaded || !market.isIBKRConnected() || !market.isDataFresh()) {
+        throw new Error("FRESH_MARKET_DATA_NOT_RESTORED");
+      }
+      this.dataState = "connected";
+      this.brokerRecoveryAttempts = 0;
+      this.brokerNextRecoveryAt = 0;
+      if (this.ibkrDisconnectAlerted) {
+        try { notifyIBKRReconnect(); } catch {}
+        this.ibkrDisconnectAlerted = false;
+      }
+      this.log("info", "[IBKR_RECOVERY_VERIFIED] Gateway reconnected, account and broker exposure checked, live market data fresh");
+    } catch (error: any) {
+      this.dataState = "waiting";
+      this.brokerRecoveryAttempts = Math.max(1, this.brokerRecoveryAttempts);
+      const backoffMs = Math.min(60_000, 5_000 * (2 ** Math.min(4, this.brokerRecoveryAttempts - 1)));
+      this.brokerNextRecoveryAt = Date.now() + backoffMs;
+      this.log("warn", `[IBKR_RECOVERY_WAIT] ${error?.message || error}; retryInMs=${backoffMs}; entries blocked`);
+    } finally {
+      this.brokerRecoveryBusy = false;
+    }
+  }
+
   private async refreshData() {
     try {
+      // A stale 'connected' state after an IB Gateway socket drop previously
+      // prevented loadPrices() retries and made the bot look alive but blind.
+      if (!market.isIBKRConnected()) {
+        this.dataState = "waiting";
+        void this.superviseBrokerConnection();
+        return;
+      }
       if (this.dataState !== "connected") {
         this.dataRetryCount++;
         this.log("info", `إعادة محاولة تحميل البيانات (محاولة ${this.dataRetryCount})...`);
@@ -1217,6 +1300,14 @@ export class TradingEngine {
       }
       this.enforceLiveSafeConfig();
       const liveSafeStopReason = this.getLiveSafeStopReason();
+      if (liveSafeStopReason === "IBKR_NOT_CONNECTED" || liveSafeStopReason === "IBKR_ACCOUNT_UNAVAILABLE" ||
+          liveSafeStopReason.startsWith("IBKR_MARKET_DATA_NOT_LIVE")) {
+        // Recoverable infrastructure outage is NOT a reason to permanently
+        // set running=false. Keep scans blocked until the supervisor verifies.
+        this.dataState = "waiting";
+        void this.superviseBrokerConnection();
+        return;
+      }
       if (liveSafeStopReason) {
         this.stopTradingNow(liveSafeStopReason);
         return;
