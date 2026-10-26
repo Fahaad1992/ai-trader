@@ -1265,7 +1265,7 @@ class IBKRClient {
       right: type === "call" ? "C" : type === "put" ? "P" : "INVALID",
       action:"BUY", quantity, multiplier:100, exchange:"SMART" });
     if (!scope.allowed || !Number.isFinite(strike) || strike <= 0 ||
-        !/^\\d{4}-?\\d{2}-?\\d{2}$/.test(expiry) ||
+        !/^\d{4}-?\d{2}-?\d{2}$/.test(expiry) ||
         !Number.isFinite(entryLimitPrice) || entryLimitPrice <= 0 ||
         !Number.isFinite(stopLossPrice) || stopLossPrice <= 0 ||
         stopLossPrice >= entryLimitPrice) {
