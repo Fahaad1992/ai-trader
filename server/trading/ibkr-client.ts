@@ -238,6 +238,10 @@ class IBKRClient {
   // Data storage
   private stockPrices = new Map<string, IBKRStockData>();
   private optionData = new Map<string, IBKROptionData[]>();
+  // Requesting identical SPX option chains for every candidate caused dozens
+  // of duplicate IB API calls. Short cache + single in-flight query.
+  private spxChainCache = new Map<string, {data: any[];expiresMs: number}>();
+  private spxChainPending = new Map<string, Promise<any[]>>();
   private orderResults = new Map<number, IBKROrderResult>();
   private tickerReqMap = new Map<number, string>();
   private underlyingConIds = new Map<string, number>();
@@ -277,6 +281,8 @@ class IBKRClient {
       } catch {}
     }
     this.pendingRequests.clear();
+    this.spxChainCache.clear();
+    this.spxChainPending.clear();
 
     this.ib = null;
     this.connected = false;
@@ -808,12 +814,36 @@ class IBKRClient {
     });
   }
 
+  private async getCachedSPXChain(
+    underlying: string, type: "call" | "put", normalizedExpiry: string,
+  ): Promise<any[]> {
+    if (underlying !== "SPX") return this.getOptionChain(underlying, type, 0, 0, normalizedExpiry);
+    const key = `${underlying}:${normalizedExpiry}`;
+    const cached = this.spxChainCache.get(key);
+    if (cached && cached.expiresMs > Date.now() && this.isConnected()) return cached.data;
+    const already = this.spxChainPending.get(key);
+    if (already) return already;
+    const pending = (async (): Promise<any[]> => {
+      try {
+        const data = await this.getOptionChain(underlying, type, 0, 0, normalizedExpiry);
+        const rows = Array.isArray(data) ? data as any[] : [];
+        if (rows.length > 0 && this.isConnected())
+          this.spxChainCache.set(key, { data: rows, expiresMs: Date.now() + 30_000 });
+        return rows;
+      } catch { return []; }
+    })();
+    this.spxChainPending.set(key,pending);
+    try { return await pending; } finally {
+      if (this.spxChainPending.get(key) === pending) this.spxChainPending.delete(key);
+    }
+  }
+
   async getOptionSnapshot(underlying: string, type: "call" | "put", strike: number, expiry: string): Promise<IBKROptionData | null> {
     if (!this.connected || !this.ib) return null;
 
     const reqId = this.getNextReqId();
     const normalizedExpiry = expiry.replace(/-/g, "");
-    const chainRows = await this.getOptionChain(underlying, type, 0, 0, normalizedExpiry);
+    const chainRows = await this.getCachedSPXChain(underlying, type, normalizedExpiry);
     const validRows = (chainRows as any[]).filter((row: any) =>
       Array.isArray(row?.expirations) && row.expirations.includes(normalizedExpiry) &&
       Array.isArray(row?.strikes) && row.strikes.some((value: number) => typeof value === "number" && value > 0)
@@ -838,6 +868,10 @@ class IBKRClient {
 
     let resolvedStrike = strike > 0 ? strike : 0;
     const strikeExists = resolvedStrike > 0 && availableStrikes.some((value: number) => Math.abs(value - resolvedStrike) < 0.0001);
+    if (resolvedStrike > 0 && !strikeExists) {
+      // Never silently return a different contract to the caller.
+      return null;
+    }
     if (!strikeExists) {
       const anchorPrice = underlyingPrice > 0 ? underlyingPrice : (resolvedStrike > 0 ? resolvedStrike : 0);
       if (!(anchorPrice > 0)) return null;
