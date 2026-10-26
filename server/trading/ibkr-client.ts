@@ -5,6 +5,7 @@
 import IB from "ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
 import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
+import { checkBrokerEntrySafety } from "./broker-exposure-guard.js";
 
 type IBApi = any;
 type Contract = Record<string, any>;
@@ -221,6 +222,7 @@ class IBKRClient {
   private tickerFeedModes = new Map<string, Exclude<MarketDataMode, "unknown">>();
   private lastAccountSummary: IBKRAccountSummary | null = null;
   private brokerExposureRequest: Promise<BrokerExposureSnapshot | null> | null = null;
+  private optionEntryInFlight = false;
   private connectPromise: Promise<boolean> | null = null;
   private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -1203,6 +1205,36 @@ class IBKRClient {
       } as IBKROrderResult;
     }
     if (!this.connected || !this.ib) return null;
+    if (this.optionEntryInFlight) {
+      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0,
+        avgFillPrice: 0, lastFillPrice: 0, rejectReason: "IBKR_OPTION_ENTRY_ALREADY_IN_FLIGHT" };
+    }
+    this.optionEntryInFlight = true;
+    try {
+      // Fail closed: the authoritative source after disconnect/restart is the
+      // broker's completed positions + ALL open orders, never local state alone.
+      const [exposure, balance] = await Promise.all([
+        this.getBrokerExposureSnapshot(), this.getAccountSummary(),
+      ]);
+      const brokerSafety = checkBrokerEntrySafety({
+        brokerConnected: this.isConnected(),
+        configuredAccountId: String(process.env.IBKR_REQUIRED_ACCOUNT_ID || ""),
+        connectedAccountId: this.accountId,
+        snapshot: exposure,
+        balance,
+        localOpenTradeCount: 0, // Engine separately checks local DB open trades.
+        entryPremium: entryLimitPrice,
+        quantity,
+        multiplier: 100,
+        nowMs: Date.now(),
+      });
+      if (!brokerSafety.allowed) {
+        const reason = brokerSafety.reasons.join(",");
+        console.error("[IBKR_OPTION_ENTRY_GUARD_BLOCK] " + reason);
+        return { orderId: -1, status: "Rejected", filled: 0, remaining: 0,
+          avgFillPrice: 0, lastFillPrice: 0,
+          rejectReason: "IBKR_OPTION_ENTRY_GUARD_BLOCK:" + reason };
+      }
 
     const useTarget = typeof targetPrice === "number" && isFinite(targetPrice) && targetPrice > 0;
     const parentOrderId = this.nextOrderId++;
@@ -1320,6 +1352,9 @@ class IBKRClient {
         childTargetStatus: targetResult?.status,
       };
     });
+    } finally {
+      this.optionEntryInFlight = false;
+    }
   }
 
   async cancelOrder(orderId: number): Promise<void> {
