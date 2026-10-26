@@ -709,6 +709,13 @@ export class MarketDataProvider {
     strike: number,
     expiry: string
   ): Promise<OptionQuote | null> {
+    if (isSPXOptionsMode() || underlying.toUpperCase() === "SPX") {
+      // No Polygon or index-price proxy for monitoring an actual SPX option.
+      // A verified persistent IBKR option-BID subscription is still missing.
+      // Return NO quote rather than invent a price/stop update.
+      console.error("[SPX_OPTION_MONITORING_BLOCKED] No verified IBKR live option-BID streaming monitor installed");
+      return null;
+    }
     if (!POLYGON_ENABLED) {
       console.error(`[DATA_BLOCK] ${underlying}: Polygon unavailable for option pricing | source=none | ibkrConnected=${this.isIBKRConnected()} | polygonAvailable=false | yahooFallbackUsed=false`);
       return null;
