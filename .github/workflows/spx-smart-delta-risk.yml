@@ -1,0 +1,29 @@
+name: SPX adaptive delta and real balance preflight
+
+on:
+  push:
+    branches:
+      - chatgpt/spx-smart-delta-risk-20261026
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies without scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: SPX funded adaptive-delta risk tests and full unit suite
+        run: npx vitest run
+      - name: TypeScript no emit
+        run: npx tsc --noEmit
+      - name: Build production bundle without running the bot
+        run: npm run build
