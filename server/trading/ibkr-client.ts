@@ -4,6 +4,8 @@
  */
 import IB from "ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
+import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
+import { checkBrokerEntrySafety } from "./broker-exposure-guard.js";
 
 type IBApi = any;
 type Contract = Record<string, any>;
@@ -211,6 +213,10 @@ export interface IBKRAccountSummary {
 class IBKRClient {
   private ib: IBApi | null = null;
   private connected = false;
+  // IBKR error 1100/2110 can lose broker connectivity WITHOUT dropping the
+  // local Gateway socket. 1101 specifically invalidates live data subscriptions.
+  private brokerBackendLost = false;
+  private subscriptionsNeedRefresh = false;
   private connecting = false;
   private connectTime = 0;
   private nextOrderId = 0;
@@ -219,6 +225,8 @@ class IBKRClient {
   private latestMarketDataMode: MarketDataMode = IBKR_MARKET_DATA_TYPE === 1 ? "unknown" : "delayed";
   private tickerFeedModes = new Map<string, Exclude<MarketDataMode, "unknown">>();
   private lastAccountSummary: IBKRAccountSummary | null = null;
+  private brokerExposureRequest: Promise<BrokerExposureSnapshot | null> | null = null;
+  private optionEntryInFlight = false;
   private connectPromise: Promise<boolean> | null = null;
   private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -267,6 +275,8 @@ class IBKRClient {
 
     this.ib = null;
     this.connected = false;
+    this.brokerBackendLost = false;
+    this.subscriptionsNeedRefresh = false;
     this.connecting = false;
     this.connectPromise = null;
     this.accountId = "";
@@ -279,7 +289,7 @@ class IBKRClient {
   }
 
   async connect(): Promise<boolean> {
-    if (this.connected && this.ib) return true;
+    if (this.connected && this.ib) return !this.brokerBackendLost;
     if (this.connectPromise) return this.connectPromise;
 
     if (this.ib) {
@@ -308,17 +318,19 @@ class IBKRClient {
         client.on(EventName.connected, () => {
           if (this.ib !== client) return;
           console.log("[IBKR] Connected to IB Gateway!");
+          // Socket open is NOT a complete TWS API handshake. Do not mark
+          // connection usable until managedAccounts and nextValidId arrive.
           this.connected = true;
+          this.brokerBackendLost = false;
+          this.subscriptionsNeedRefresh = false;
           this.connectTime = Date.now();
-          this.connecting = false;
-          this.clearConnectTimeout();
           // Use LIVE market data in live trading, otherwise fall back to DELAYED.
           client.reqMarketDataType(IBKR_MARKET_DATA_TYPE);
           console.log(`[IBKR] Market data type set to ${IBKR_MARKET_DATA_TYPE_LABEL} (${IBKR_MARKET_DATA_TYPE}) for TRADING_MODE=${IBKR_TRADING_MODE}`);
           client.reqCurrentTime();
           client.reqManagedAccts();
           client.reqIds(1);
-          finalize(true);
+          // Both responses are validated in their own callbacks below.
         });
 
         client.on(EventName.disconnected, () => {
@@ -327,7 +339,9 @@ class IBKRClient {
           console.log(`[IBKR] Disconnected from IB Gateway | wasConnected=${this.connected} | uptimeMs=${uptime} | accountId=${this.accountId || "none"} | subscribedTickers=${Array.from(this.tickerReqMap.values()).join(",") || "none"}`);
           const wasConnected = this.connected;
           this.cleanupConnectionState({ disconnectSocket: false });
-          if (!wasConnected) finalize(false);
+          // Important: a disconnect during the handshake must still settle
+          // the pending connect promise; otherwise reconnect hangs forever.
+          finalize(false);
         });
 
         client.on(EventName.error, (err: Error, data?: { id?: number; code?: number }) => {
@@ -336,6 +350,24 @@ class IBKRClient {
           const reqId = Number(data?.id ?? -1);
           const errorMessage = err?.message || String(err);
           const msg = `[IBKR] Error: ${errorMessage} (code: ${code}, reqId: ${reqId})`;
+          if (code === 1100 || code === 2110 || code === 1300) {
+            this.brokerBackendLost = true;
+            this.latestMarketDataMode = "unknown";
+            console.error(`[IBKR_BACKEND_LOST] code=${code}, entries suspended pending verified connection`);
+          } else if (code === 1101) {
+            this.brokerBackendLost = false;
+            this.subscriptionsNeedRefresh = true;
+            this.latestMarketDataMode = "unknown";
+            this.tickerReqMap.clear();
+            this.tickerFeedModes.clear();
+            this.stockPrices.clear();
+            console.warn("[IBKR_DATA_LOST_1101] Market subscriptions invalidated; resubscription required");
+          } else if (code === 1102) {
+            this.brokerBackendLost = false;
+            this.subscriptionsNeedRefresh = false;
+            console.log("[IBKR_DATA_RETAINED_1102] Backend restored; subscriptions retained");
+          }
+
 
           if (isIgnorableIbInfoCode(code)) {
             console.log(`[IBKR] Info: ${errorMessage}`);
@@ -396,6 +428,7 @@ class IBKRClient {
           if (this.ib !== client) return;
           this.nextOrderId = orderId;
           console.log(`[IBKR] Next valid order ID: ${orderId}`);
+          if (this.connected && this.accountId && this.nextOrderId > 0) finalize(true);
         });
 
         // Managed accounts
@@ -403,6 +436,7 @@ class IBKRClient {
           if (this.ib !== client) return;
           this.accountId = accountsList.split(",")[0]?.trim() || "";
           console.log(`[IBKR] Account ID: ${this.accountId}`);
+          if (this.connected && this.accountId && this.nextOrderId > 0) finalize(true);
         });
 
         // Current time
@@ -565,8 +599,8 @@ class IBKRClient {
 
         // Timeout
         this.connectTimeout = setTimeout(() => {
-          if (this.ib !== client || this.connected) return;
-          console.error("[IBKR] Connection timeout after 15s");
+          if (this.ib !== client || settled) return;
+          console.error("[IBKR] Connection/handshake timeout after 15s");
           this.cleanupConnectionState({ disconnectSocket: true });
           finalize(false);
         }, 15000);
@@ -586,7 +620,15 @@ class IBKRClient {
   }
 
   isConnected(): boolean {
-    return this.connected;
+    return this.connected && !this.brokerBackendLost && !this.subscriptionsNeedRefresh;
+  }
+
+  needsMarketResubscription(): boolean {
+    return this.subscriptionsNeedRefresh;
+  }
+
+  markMarketDataResubscribed(): void {
+    if (this.connected && !this.brokerBackendLost) this.subscriptionsNeedRefresh = false;
   }
 
   getAccountId(): string {
@@ -1201,6 +1243,36 @@ class IBKRClient {
       } as IBKROrderResult;
     }
     if (!this.connected || !this.ib) return null;
+    if (this.optionEntryInFlight) {
+      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0,
+        avgFillPrice: 0, lastFillPrice: 0, rejectReason: "IBKR_OPTION_ENTRY_ALREADY_IN_FLIGHT" };
+    }
+    this.optionEntryInFlight = true;
+    try {
+      // Fail closed: the authoritative source after disconnect/restart is the
+      // broker's completed positions + ALL open orders, never local state alone.
+      const [exposure, balance] = await Promise.all([
+        this.getBrokerExposureSnapshot(), this.getAccountSummary(),
+      ]);
+      const brokerSafety = checkBrokerEntrySafety({
+        brokerConnected: this.isConnected(),
+        configuredAccountId: String(process.env.IBKR_REQUIRED_ACCOUNT_ID || ""),
+        connectedAccountId: this.accountId,
+        snapshot: exposure,
+        balance,
+        localOpenTradeCount: 0, // Engine separately checks local DB open trades.
+        entryPremium: entryLimitPrice,
+        quantity,
+        multiplier: 100,
+        nowMs: Date.now(),
+      });
+      if (!brokerSafety.allowed) {
+        const reason = brokerSafety.reasons.join(",");
+        console.error("[IBKR_OPTION_ENTRY_GUARD_BLOCK] " + reason);
+        return { orderId: -1, status: "Rejected", filled: 0, remaining: 0,
+          avgFillPrice: 0, lastFillPrice: 0,
+          rejectReason: "IBKR_OPTION_ENTRY_GUARD_BLOCK:" + reason };
+      }
 
     const useTarget = typeof targetPrice === "number" && isFinite(targetPrice) && targetPrice > 0;
     const parentOrderId = this.nextOrderId++;
@@ -1241,7 +1313,7 @@ class IBKRClient {
       transmit: true,
     };
 
-    return new Promise((resolve, reject) => {
+    return await new Promise<IBKROrderResult | null>((resolve) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(parentOrderId);
         const parentResult = this.orderResults.get(parentOrderId);
@@ -1318,6 +1390,9 @@ class IBKRClient {
         childTargetStatus: targetResult?.status,
       };
     });
+    } finally {
+      this.optionEntryInFlight = false;
+    }
   }
 
   async cancelOrder(orderId: number): Promise<void> {
@@ -1481,65 +1556,158 @@ class IBKRClient {
     return updated?.last || updated?.close || null;
   }
 
-  async getAccountSummary(): Promise<IBKRAccountSummary | null> {
-    if (!this.connected || !this.ib) return null;
-
-    const reqId = this.getNextReqId();
-    const tags = "NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower";
-
-    return new Promise((resolve) => {
-      const summary: Partial<IBKRAccountSummary> = {
-        accountId: this.accountId,
-        netLiquidation: 0,
-        totalCashValue: 0,
-        availableFunds: 0,
-        buyingPower: 0,
-        currency: "USD",
-        timestamp: Date.now(),
-      };
-
+  /**
+   * Read-only position + ALL open-order reconciliation. Return null on ANY
+   * failure or timeout; never infer "flat" from an empty partial callback.
+   * Used before every attempted SPX bracket order, including after restart.
+   */
+  async getBrokerExposureSnapshot(): Promise<BrokerExposureSnapshot | null> {
+    if (!this.connected || !this.ib || !this.accountId) return null;
+    if (this.brokerExposureRequest) return this.brokerExposureRequest;
+    const client = this.ib;
+    const accountId = this.accountId;
+    const request = new Promise<BrokerExposureSnapshot | null>((resolve) => {
+      const positions: BrokerExposureSnapshot["positions"][number][] = [];
+      const openOrders: BrokerExposureSnapshot["openOrders"][number][] = [];
+      let positionDone = false;
+      let ordersDone = false;
+      let settled = false;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
       const cleanup = () => {
-        clearTimeout(timeout);
-        this.ib!.off(EventName.accountSummary, onSummary);
-        this.ib!.off(EventName.accountSummaryEnd, onEnd);
-        try { this.ib!.cancelAccountSummary(reqId); } catch {}
+        if (timeout) clearTimeout(timeout);
+        removeListenerSafe(client, "position", onPosition);
+        removeListenerSafe(client, "positionEnd", onPositionEnd);
+        removeListenerSafe(client, "openOrder", onOpenOrder);
+        removeListenerSafe(client, "openOrderEnd", onOpenOrderEnd);
+        try { if (typeof client.cancelPositions === "function") client.cancelPositions(); } catch {}
       };
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (!ok || !this.connected || this.ib !== client || this.accountId !== accountId) {
+          resolve(null);
+          return;
+        }
+        resolve({ accountId, fetchedAtMs: Date.now(), completed: true, positions, openOrders });
+      };
+      const onPosition = (account: unknown, contract: any, quantity: unknown) => {
+        const qty = Number(quantity);
+        if (String(account || "") !== accountId) {
+          // Another account appearing is unsafe to ignore in this single-account bot.
+          finish(false);
+          return;
+        }
+        if (!Number.isFinite(qty) || !contract || !Number.isFinite(Number(contract.conId))) {
+          finish(false); return;
+        }
+        if (qty !== 0) positions.push({
+          account: accountId, conId: Number(contract.conId),
+          symbol: String(contract.symbol || "?"), quantity: qty,
+        });
+      };
+      const onPositionEnd = () => {
+        positionDone = true;
+        if (ordersDone) finish(true);
+      };
+      const onOpenOrder = (id: unknown, contract: any, order: any, state: any) => {
+        if (!Number.isSafeInteger(Number(id)) || !contract || !order) {
+          finish(false); return;
+        }
+        const status = String(state?.status || order?.status || "UNKNOWN");
+        // IBKR openOrder callbacks list working orders. Unknown statuses block.
+        openOrders.push({
+          orderId: Number(id), conId: Number(contract?.conId || 0),
+          symbol: String(contract?.symbol || "?"), status,
+        });
+      };
+      const onOpenOrderEnd = () => {
+        ordersDone = true;
+        if (positionDone) finish(true);
+      };
+      try {
+        client.on("position", onPosition);
+        client.on("positionEnd", onPositionEnd);
+        client.on("openOrder", onOpenOrder);
+        client.on("openOrderEnd", onOpenOrderEnd);
+        timeout = setTimeout(() => finish(false), 6000);
+        if (typeof client.reqPositions !== "function" ||
+            typeof client.reqAllOpenOrders !== "function") {
+          finish(false); return;
+        }
+        client.reqPositions();
+        client.reqAllOpenOrders();
+      } catch {
+        finish(false);
+      }
+    });
+    this.brokerExposureRequest = request;
+    try { return await request; } finally {
+      if (this.brokerExposureRequest === request) this.brokerExposureRequest = null;
+    }
+  }
 
-      const finalize = () => {
+  async getAccountSummary(): Promise<IBKRAccountSummary | null> {
+    const client = this.ib;
+    if (!this.isConnected() || !client || !this.accountId) return null;
+    const accountId = this.accountId;
+    const reqId = this.getNextReqId();
+    const tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower"] as const;
+    return new Promise<IBKRAccountSummary | null>((resolve) => {
+      const data: Record<string, number> = {};
+      let completed = false;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = () => {
+        if (timeout) clearTimeout(timeout);
+        removeListenerSafe(client, EventName.accountSummary, onSummary);
+        removeListenerSafe(client, EventName.accountSummaryEnd, onEnd);
+        try { client.cancelAccountSummary(reqId); } catch {}
+      };
+      const finish = (valid: boolean) => {
+        if (completed) return;
+        completed = true;
+        cleanup();
+        if (!valid || !this.isConnected() || this.ib !== client ||
+            this.accountId !== accountId ||
+            !tags.every(tag => Number.isFinite(data[tag]))) {
+          resolve(null);
+          return;
+        }
         const result: IBKRAccountSummary = {
-          accountId: String(summary.accountId || this.accountId || ""),
-          netLiquidation: Number(summary.netLiquidation || 0),
-          totalCashValue: Number(summary.totalCashValue || 0),
-          availableFunds: Number(summary.availableFunds || 0),
-          buyingPower: Number(summary.buyingPower || 0),
-          currency: String(summary.currency || "USD"),
+          accountId,
+          netLiquidation: data.NetLiquidation,
+          totalCashValue: data.TotalCashValue,
+          availableFunds: data.AvailableFunds,
+          buyingPower: data.BuyingPower,
+          currency: "USD",
           timestamp: Date.now(),
         };
         this.lastAccountSummary = result;
-        cleanup();
         resolve(result);
       };
-
-      const onSummary = (incomingReqId: number, account: string, tag: string, value: string, currency: string) => {
-        if (incomingReqId !== reqId) return;
-        summary.accountId = account || summary.accountId || this.accountId;
-        if (currency) summary.currency = currency;
-        const numericValue = Number(value || 0);
-        if (tag === "NetLiquidation") summary.netLiquidation = numericValue;
-        if (tag === "TotalCashValue") summary.totalCashValue = numericValue;
-        if (tag === "AvailableFunds") summary.availableFunds = numericValue;
-        if (tag === "BuyingPower") summary.buyingPower = numericValue;
+      const onSummary = (
+        incomingReqId: number, account: string, tag: string,
+        value: string, currency: string,
+      ) => {
+        if (incomingReqId !== reqId || completed) return;
+        if (account && account !== accountId) { finish(false); return; }
+        if (currency && currency !== "USD") return;
+        if (!tags.some(t => t === tag)) return;
+        const valueNum = Number(value);
+        if (!Number.isFinite(valueNum)) { finish(false); return; }
+        data[tag] = valueNum;
       };
-
       const onEnd = (incomingReqId: number) => {
-        if (incomingReqId !== reqId) return;
-        finalize();
+        if (incomingReqId === reqId) finish(true);
       };
-
-      const timeout = setTimeout(finalize, 10000);
-      this.ib!.on(EventName.accountSummary, onSummary);
-      this.ib!.on(EventName.accountSummaryEnd, onEnd);
-      this.ib!.reqAccountSummary(reqId, "All", tags);
+      try {
+        client.on(EventName.accountSummary, onSummary);
+        client.on(EventName.accountSummaryEnd, onEnd);
+        timeout = setTimeout(() => finish(false), 10000);
+        client.reqAccountSummary(reqId, "All", tags.join(","));
+      } catch {
+        finish(false);
+      }
     });
   }
 

@@ -481,6 +481,10 @@ export class TradingEngine {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private brokerAccountSnapshot: BrokerAccountSnapshot | null = null;
   private brokerAccountPollTimer: ReturnType<typeof setInterval> | null = null;
+  private brokerRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+  private brokerRecoveryBusy = false;
+  private brokerRecoveryAttempts = 0;
+  private brokerNextRecoveryAt = 0;
   private ibkrStopOrderIds = new Map<string, number>();
   private lastExitReason: string | null = null;
   private lastExitPnl: number = 0;
@@ -849,6 +853,30 @@ export class TradingEngine {
       await this.refreshBrokerAccountSnapshot();
       const status = market.getIBKRStatus();
       this.log("info", `✅ IBKR متصل! Account: ${market.getIBKRAccountId()} | PRICE_SOURCE=IBKR | EXECUTION=IBKR | MARKET_DATA=${status.requestedMarketDataType}/${status.marketDataMode}`);
+      // Read-only restart audit: local DB can miss an order placed shortly
+      // before a crash. Never assume absence from local DB means no exposure.
+      try {
+        const brokerExposure = await ibkr.getBrokerExposureSnapshot();
+        if (!brokerExposure) {
+          this.log("error", "[IBKR_RESTART_RECONCILIATION_UNKNOWN] Broker position/order snapshot unavailable. New live options orders are blocked at broker entry gate.");
+          try { notifyCriticalError("IBKR recovery", "Could not verify broker positions/orders after restart. No new option entry until IBKR reconciliation succeeds."); } catch {}
+        } else if (brokerExposure.positions.length || brokerExposure.openOrders.length) {
+          const localOpen = this.getOpenTrades().length;
+          this.log("warn", `[IBKR_RESTART_EXPOSURE_FOUND] brokerPositions=${brokerExposure.positions.length} brokerOpenOrders=${brokerExposure.openOrders.length} localOpen=${localOpen} | new options entry blocked pending verified management`);
+          try { notifyCriticalError("IBKR existing exposure", `Detected ${brokerExposure.positions.length} broker positions and ${brokerExposure.openOrders.length} open orders (local DB: ${localOpen}). New options entry blocked; existing broker orders remain unchanged.`); } catch {}
+          if (brokerExposure.positions.length > 0 && brokerExposure.openOrders.length === 0) {
+            this.log("error", "[IBKR_POSSIBLY_UNPROTECTED_POSITION] Broker holds position(s) but has no visible working stop/order. Review urgently; bot will not submit a duplicate entry.");
+            try { notifyCriticalError("IBKR UNPROTECTED POSITION", "IBKR reports open positions but NO visible open orders. Check the positions and protective stops urgently. Bot cannot safely reconstruct the missing order mapping automatically."); } catch {}
+          }
+        } else if (this.getOpenTrades().length > 0) {
+          this.log("warn", `[IBKR_RESTART_LOCAL_BROKER_MISMATCH] localOpen=${this.getOpenTrades().length} broker exposure empty; investigate before trading`);
+          try { notifyCriticalError("IBKR account mismatch", "Local trade records exist but broker shows no open positions/orders. Review before trading."); } catch {}
+        } else {
+          this.log("info", "[IBKR_RESTART_RECONCILIATION_OK] No broker positions, orders, or local open trades at startup");
+        }
+      } catch (reconcileError: any) {
+        this.log("error", `[IBKR_RESTART_RECONCILIATION_FAILED] ${reconcileError?.message || reconcileError}; option entry stays fail-closed`);
+      }
     } else {
       this.ibkrDisconnectAlerted = true;
       this.log("warn", "⚠️ IBKR غير متصل - لا يوجد أي fallback، وسيبقى التداول محظورًا حتى يعود الاتصال الحي" );
@@ -903,6 +931,10 @@ export class TradingEngine {
       }
     }
 
+    // A separate 5-second health supervisor detects dropped sockets even
+    // while the 90s signal scanner or 120s market refresh is idle.
+    this.brokerRecoveryTimer = setInterval(() => { void this.superviseBrokerConnection(); }, 5_000);
+    void this.superviseBrokerConnection();
     this.scanTimer = setInterval(() => this.parallelScan(), 90_000);
     this.refreshTimer = setInterval(() => this.refreshData(), 120_000);
     this.pnlTimer = setInterval(() => this.updateOpenTradePrices(), 30_000);
@@ -913,6 +945,7 @@ export class TradingEngine {
 
   stop() {
     this.running = false;
+    if (this.brokerRecoveryTimer) { clearInterval(this.brokerRecoveryTimer); this.brokerRecoveryTimer = null; }
     if (this.scanTimer) { clearInterval(this.scanTimer); this.scanTimer = null; }
     if (this.refreshTimer) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
     if (this.pnlTimer) { clearInterval(this.pnlTimer); this.pnlTimer = null; }
@@ -922,43 +955,86 @@ export class TradingEngine {
     try { notifyBotStopped("تم إيقاف البوت"); } catch {}
   }
 
+  /**
+   * Detect Gateway outages and re-establish subscriptions without ever
+   * sending, modifying, or cancelling orders automatically.
+   * Re-entry is broker-guarded, and stale/ambiguous recovery stays blocked.
+   */
+  private async superviseBrokerConnection(): Promise<void> {
+    if (!this.running || this.brokerRecoveryBusy) return;
+    const connected = market.isIBKRConnected();
+    if (connected && this.dataState === "connected") return;
+    if (!connected) {
+      this.dataState = "waiting";
+      if (!this.ibkrDisconnectAlerted) {
+        this.log("error", "[IBKR_GATEWAY_LOST] Connection lost; blocking new entries and keeping existing broker-side orders unchanged");
+        try { notifyIBKRDisconnect(); } catch {}
+        this.ibkrDisconnectAlerted = true;
+      }
+    }
+    if (Date.now() < this.brokerNextRecoveryAt) return;
+    this.brokerRecoveryBusy = true;
+    try {
+      if (!connected) {
+        this.brokerRecoveryAttempts++;
+        const ok = await market.connectIBKR();
+        if (!ok || !market.isIBKRConnected()) {
+          throw new Error("GATEWAY_RECONNECT_FAILED");
+        }
+      }
+      const connectedAccount = market.getIBKRAccountId();
+      const configuredAccount = String(process.env.IBKR_REQUIRED_ACCOUNT_ID || "");
+      if (!configuredAccount || connectedAccount !== configuredAccount) {
+        throw new Error("ACCOUNT_NOT_VERIFIED_AFTER_RECONNECT");
+      }
+      // Neither local DB nor the cached quote alone is enough to restore
+      // confidence. Ask the broker to finish BOTH exposure enumerations.
+      const exposure = await ibkr.getBrokerExposureSnapshot();
+      if (!exposure || !exposure.completed || exposure.accountId !== configuredAccount) {
+        throw new Error("BROKER_EXPOSURE_RECONCILIATION_INCOMPLETE");
+      }
+      if (exposure.positions.length || exposure.openOrders.length) {
+        this.log("warn", `[IBKR_RECOVERY_EXISTING_EXPOSURE] positions=${exposure.positions.length} openOrders=${exposure.openOrders.length}. No additional entry permitted.`);
+        if (exposure.positions.length > 0 && exposure.openOrders.length === 0) {
+          try { notifyCriticalError("IBKR POSSIBLY UNPROTECTED", "Broker holds a position but no working orders were visible after reconnect. Inspect protective orders urgently."); } catch {}
+        }
+      }
+      const loaded = await market.loadPrices();
+      if (!loaded || !market.isIBKRConnected() || !market.isDataFresh()) {
+        throw new Error("FRESH_MARKET_DATA_NOT_RESTORED");
+      }
+      this.dataState = "connected";
+      this.brokerRecoveryAttempts = 0;
+      this.brokerNextRecoveryAt = 0;
+      if (this.ibkrDisconnectAlerted) {
+        try { notifyIBKRReconnect(); } catch {}
+        this.ibkrDisconnectAlerted = false;
+      }
+      this.log("info", "[IBKR_RECOVERY_VERIFIED] Gateway reconnected, account and broker exposure checked, live market data fresh");
+    } catch (error: any) {
+      this.dataState = "waiting";
+      this.brokerRecoveryAttempts = Math.max(1, this.brokerRecoveryAttempts);
+      const backoffMs = Math.min(60_000, 5_000 * (2 ** Math.min(4, this.brokerRecoveryAttempts - 1)));
+      this.brokerNextRecoveryAt = Date.now() + backoffMs;
+      this.log("warn", `[IBKR_RECOVERY_WAIT] ${error?.message || error}; retryInMs=${backoffMs}; entries blocked`);
+    } finally {
+      this.brokerRecoveryBusy = false;
+    }
+  }
+
   private async refreshData() {
     try {
+      // A stale 'connected' state after an IB Gateway socket drop previously
+      // prevented loadPrices() retries and made the bot look alive but blind.
+      if (!market.isIBKRConnected()) {
+        this.dataState = "waiting";
+        void this.superviseBrokerConnection();
+        return;
+      }
       if (this.dataState !== "connected") {
-        this.dataRetryCount++;
-        this.log("info", `إعادة محاولة تحميل البيانات (محاولة ${this.dataRetryCount})...`);
-        const loaded = await market.loadPrices();
-        if (loaded) {
-          this.dataState = "connected";
-          this.waitingModeAlerted = false;
-          this.dataLoadFailureAlerted = false;
-          this.dataSourceFailureAlerted = false;
-          this.healthFailureAlerted = false;
-          if (market.isIBKRConnected() && this.ibkrDisconnectAlerted) {
-            try { notifyIBKRReconnect(); } catch {}
-            this.ibkrDisconnectAlerted = false;
-          }
-          this.log("info", `تم الاتصال بالبيانات بنجاح! SPY=$${market.getPrice("SPY")} | QQQ=$${market.getPrice("QQQ")}`);
-        } else {
-          this.dataState = "waiting";
-          this.log("warn", "لا زالت البيانات غير متاحة - البوت شغال وينتظر...");
-          if (!this.dataLoadFailureAlerted) {
-            try { notifyDataLoadFailure("تعذر تحميل بيانات السوق"); } catch {}
-            this.dataLoadFailureAlerted = true;
-          }
-          if (!this.waitingModeAlerted) {
-            try { notifyWaitingMode("النظام بانتظار عودة البيانات"); } catch {}
-            this.waitingModeAlerted = true;
-          }
-          if (this.dataRetryCount >= 3 && !this.dataSourceFailureAlerted) {
-            try { notifyDataSourceFailure("بيانات السوق", "تعذر استعادة البيانات بعد عدة محاولات"); } catch {}
-            this.dataSourceFailureAlerted = true;
-          }
-          if (this.dataRetryCount >= 3 && !this.healthFailureAlerted) {
-            try { notifyHealthFailure("مصدر البيانات غير متاح بعد عدة محاولات"); } catch {}
-            this.healthFailureAlerted = true;
-          }
-        }
+        // Never let a timed price refresh silently promote a reconnected
+        // socket to trade-ready without verifying account and exposure.
+        void this.superviseBrokerConnection();
         return;
       }
       await market.refreshPrices();
@@ -1193,6 +1269,14 @@ export class TradingEngine {
       }
       this.enforceLiveSafeConfig();
       const liveSafeStopReason = this.getLiveSafeStopReason();
+      if (liveSafeStopReason === "IBKR_NOT_CONNECTED" || liveSafeStopReason === "IBKR_ACCOUNT_UNAVAILABLE" ||
+          liveSafeStopReason.startsWith("IBKR_MARKET_DATA_NOT_LIVE")) {
+        // Recoverable infrastructure outage is NOT a reason to permanently
+        // set running=false. Keep scans blocked until the supervisor verifies.
+        this.dataState = "waiting";
+        void this.superviseBrokerConnection();
+        return;
+      }
       if (liveSafeStopReason) {
         this.stopTradingNow(liveSafeStopReason);
         return;

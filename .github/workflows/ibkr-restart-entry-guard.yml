@@ -1,0 +1,34 @@
+name: Broker restart entry guard checks
+
+on:
+  push:
+    branches:
+      - chatgpt/ibkr-restart-entry-safety-20261026
+    paths:
+      - server/trading/broker-exposure-guard.ts
+      - server/trading/broker-exposure-guard.test.ts
+      - server/trading/ibkr-client.ts
+      - server/trading/market-data.ts
+      - server/trading/engine.ts
+      - .github/workflows/ibkr-restart-entry-guard.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies without running native hooks
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test broker reconciliation and option logic
+        run: npx vitest run server/trading/broker-exposure-guard.test.ts shared/spx-premium-risk.test.ts server/options/premium-stop-ladder.test.ts server/options/autonomous-entry-guard.test.ts server/options/paper-event-engine.test.ts
+      - name: Production bundle compile without server start
+        run: npm run build
