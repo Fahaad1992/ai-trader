@@ -161,6 +161,50 @@ export function reconcileSPXStop(
   };
 }
 
+/**
+ * Create a durable stop record ONLY after the broker confirms both the
+ * filled position and its working stop child with the SAME contract identity.
+ * A locally assumed fill / simulated broker ACK must never reach this method.
+ */
+export function createVerifiedSPXStopRecord(input: {
+  accountId: string;
+  conId: number;
+  entryPremium: number;
+  quantity: number;
+  entryOrderId: number;
+  stopOrderId: number;
+  right: "CALL" | "PUT";
+  expiry: string;
+  strike: number;
+  tickSize: number;
+  broker: RecoveryBrokerSnapshot;
+  nowMs: number;
+}): SavedSPXStop {
+  const stop = input.broker.orders.find(o => o.orderId === input.stopOrderId);
+  const position = input.broker.positions.find(p => p.conId === input.conId);
+  if (!stop || !position || !validNumber(stop.auxPrice) ||
+      !validNumber(input.entryPremium) || input.entryPremium <= 0 ||
+      !validNumber(input.tickSize) || input.tickSize <= 0 ||
+      !validNumber(stop.permId) || stop.permId <= 0) {
+    throw new Error("SPX_INITIAL_STOP_NOT_VERIFIED_BY_BROKER");
+  }
+  const record: SavedSPXStop = {
+    accountId: input.accountId, conId: input.conId,
+    entryPremium: input.entryPremium, quantity: input.quantity,
+    entryOrderId: input.entryOrderId, stopOrderId: input.stopOrderId,
+    stopPermId: stop.permId, right: input.right,
+    expiry: input.expiry, strike: input.strike, tickSize: input.tickSize,
+    peakBid: input.entryPremium, lastConfirmedStop: stop.auxPrice,
+    lastQuoteTimestampMs: null, recordedAtMs: input.nowMs,
+  };
+  const decision = reconcileSPXStop(record, input.broker, input.accountId, input.nowMs);
+  if (decision.status !== "RESUME_MONITORING" ||
+      stop.auxPrice < input.entryPremium * 0.55 - input.tickSize / 5) {
+    throw new Error("SPX_INITIAL_STOP_POSITION_OR_PROTECTION_UNVERIFIED");
+  }
+  return record;
+}
+
 /** Pure recommendation. Never modify broker stop until ack confirmed. */
 export function previewRecoveredSPXStopRaise(
   recovered: RecoveredSPXStop,
