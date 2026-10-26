@@ -9,7 +9,7 @@ const strategyAr: Record<string, string> = {
 };
 
 const reasonAr: Record<string, string> = {
-  "take-profit": "جني أرباح",
+  "trailing-stop": "وقف متحرك / جني أرباح",
   "stop-loss": "وقف خسارة",
   trailing: "وقف متحرك",
   manual: "يدوي",
@@ -19,7 +19,7 @@ const pnlColor = (v: number) =>
   v > 0 ? "text-green-400" : v < 0 ? "text-red-400" : "text-muted-foreground";
 
 export default function HistoryPage() {
-  const { data: all, refetch, isLoading } = useClosedTrades();
+  const { data: all, refetch } = useClosedTrades();
   const [fStrategy, setFS] = useState("all");
   const [fType, setFT] = useState("all");
   const isFuturesMode = Boolean(all?.some((t) => t.tradeMode === "futures"));
@@ -49,12 +49,12 @@ export default function HistoryPage() {
           {!isFuturesMode && (
             <select value={fType} onChange={(e) => setFT(e.target.value)} className="bg-secondary text-foreground border border-border rounded-lg px-3 py-1.5 text-sm">
               <option value="all">كل الأنواع</option>
-              <option value="call">شراء</option>
-              <option value="put">بيع</option>
+              <option value="call">CALL شراء</option>
+              <option value="put">PUT شراء</option>
             </select>
           )}
           <button onClick={() => refetch()} className="px-3 py-1.5 rounded-lg border border-border text-sm hover:bg-secondary flex items-center gap-2">
-            <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} /> تحديث
+            <RefreshCw className="h-4 w-4" /> تحديث
           </button>
         </div>
       </div>
@@ -85,14 +85,14 @@ export default function HistoryPage() {
                 <tr key={t.id} className="border-b border-border/50 hover:bg-secondary/30 transition-colors">
                   <td className="py-3 px-4 text-muted-foreground ltr-nums">{t.closedAt ? new Date(t.closedAt).toLocaleDateString('ar-SA') : '-'}</td>
                   <td className="py-3 px-4 font-medium">{t.underlying}</td>
-                  {!isFuturesMode && <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-xs ${t.contractType === 'call' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>{t.contractType === 'call' ? 'شراء' : 'بيع'}</span></td>}
+                  {!isFuturesMode && <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-xs ${t.contractType === 'call' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>{t.contractType === 'call' ? 'CALL شراء' : 'PUT شراء'}</span></td>}
                   <td className="py-3 px-4"><span className="px-1.5 py-0.5 rounded text-xs bg-secondary text-muted-foreground">{strategyAr[t.strategy] ?? t.strategy}</span></td>
                   <td className="py-3 px-4 text-left ltr-nums">${t.entryPremium.toFixed(2)}</td>
                   <td className="py-3 px-4 text-left ltr-nums">${t.currentPremium.toFixed(2)}</td>
                   <td className="py-3 px-4 text-left ltr-nums">{t.quantity}</td>
                   <td className={`py-3 px-4 text-left font-bold ltr-nums ${pnlColor(t.pnl)}`}>{t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}</td>
                   <td className={`py-3 px-4 text-left ltr-nums ${pnlColor(t.pnlPercent)}`}>{t.pnlPercent >= 0 ? '+' : ''}{t.pnlPercent.toFixed(1)}%</td>
-                  <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-xs border ${t.closeReason === 'take-profit' ? 'text-green-400 border-green-400/30' : t.closeReason === 'stop-loss' ? 'text-red-400 border-red-400/30' : 'text-muted-foreground border-border'}`}>{reasonAr[t.closeReason ?? ''] ?? t.closeReason ?? 'يدوي'}</span></td>
+                  <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-xs border ${t.closeReason === 'trailing-stop' ? 'text-green-400 border-green-400/30' : t.closeReason === 'stop-loss' ? 'text-red-400 border-red-400/30' : 'text-muted-foreground border-border'}`}>{reasonAr[t.closeReason ?? ''] ?? t.closeReason ?? 'يدوي'}</span></td>
                 </tr>
               ))}
             </tbody>
