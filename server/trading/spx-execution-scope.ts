@@ -29,3 +29,14 @@ export function checkLongSPXOrderScope(q: LongSPXContractRequest): ScopeResult {
 export function enforceSPXOnlyRuntime(mode: string): void {
   if (mode !== "spx_options") throw new Error("SPX_ONLY_MODE_REQUIRED_NON_SPX_AND_FUTURES_DISABLED");
 }
+
+/** Defaulting a missing signal to PUT is forbidden. In both directions the
+ * position is LONG: BUY-to-open a CALL for confirmed uptrend or BUY-to-open
+ * a PUT for confirmed downtrend. No naked SELL-to-open route exists. */
+export function resolveLongSPXOptionFromTrend(trend: { passed: boolean; value: string } | null | undefined): "call" | "put" | null {
+  if (!trend?.passed || typeof trend.value !== "string") return null;
+  const up = trend.value.includes("صاعد");
+  const down = trend.value.includes("هابط");
+  if (up === down) return null;
+  return up ? "call" : "put";
+}
