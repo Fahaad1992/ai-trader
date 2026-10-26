@@ -20,17 +20,17 @@ describe("IBKR restart / duplicate entry fail-closed protection", () => {
   });
   it("blocks any broker position even if local DB is empty after reboot", () => {
     const a = safe();
-    a.snapshot!.positions = [{ account: "DU123", conId: 1234, symbol: "SPX", quantity: 1 }];
+    a.snapshot = { ...a.snapshot!, positions: [{ account: "DU123", conId: 1234, symbol: "SPX", quantity: 1 }] };
     expect(checkBrokerEntrySafety(a).reasons).toContain("BROKER_HAS_OPEN_POSITION");
   });
   it("blocks pending order with no broker position (unknown fill)", () => {
     const a = safe();
-    a.snapshot!.openOrders = [{ orderId: 77, conId: 1234, symbol: "SPX", status: "Submitted" }];
+    a.snapshot = { ...a.snapshot!, openOrders: [{ orderId: 77, conId: 1234, symbol: "SPX", status: "Submitted" }] };
     expect(checkBrokerEntrySafety(a).reasons).toContain("BROKER_HAS_OPEN_ORDER");
   });
   it("blocks unrelated manual positions and orders", () => {
     const a = safe();
-    a.snapshot!.positions = [{ account: "DU123", conId: 99, symbol: "MU", quantity: 2 }];
+    a.snapshot = { ...a.snapshot!, positions: [{ account: "DU123", conId: 99, symbol: "MU", quantity: 2 }] };
     expect(checkBrokerEntrySafety(a).allowed).toBe(false);
   });
   it("blocks missing, stale, incomplete or mismatched snapshots", () => {
