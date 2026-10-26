@@ -4,6 +4,7 @@
  */
 import IB from "ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
+import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
 
 type IBApi = any;
 type Contract = Record<string, any>;
@@ -219,6 +220,7 @@ class IBKRClient {
   private latestMarketDataMode: MarketDataMode = IBKR_MARKET_DATA_TYPE === 1 ? "unknown" : "delayed";
   private tickerFeedModes = new Map<string, Exclude<MarketDataMode, "unknown">>();
   private lastAccountSummary: IBKRAccountSummary | null = null;
+  private brokerExposureRequest: Promise<BrokerExposureSnapshot | null> | null = null;
   private connectPromise: Promise<boolean> | null = null;
   private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -1479,6 +1481,97 @@ class IBKRClient {
 
     const updated = this.stockPrices.get("SPX");
     return updated?.last || updated?.close || null;
+  }
+
+  /**
+   * Read-only position + ALL open-order reconciliation. Return null on ANY
+   * failure or timeout; never infer "flat" from an empty partial callback.
+   * Used before every attempted SPX bracket order, including after restart.
+   */
+  async getBrokerExposureSnapshot(): Promise<BrokerExposureSnapshot | null> {
+    if (!this.connected || !this.ib || !this.accountId) return null;
+    if (this.brokerExposureRequest) return this.brokerExposureRequest;
+    const client = this.ib;
+    const accountId = this.accountId;
+    const request = new Promise<BrokerExposureSnapshot | null>((resolve) => {
+      const positions: BrokerExposureSnapshot["positions"][number][] = [];
+      const openOrders: BrokerExposureSnapshot["openOrders"][number][] = [];
+      let positionDone = false;
+      let ordersDone = false;
+      let settled = false;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = () => {
+        if (timeout) clearTimeout(timeout);
+        removeListenerSafe(client, "position", onPosition);
+        removeListenerSafe(client, "positionEnd", onPositionEnd);
+        removeListenerSafe(client, "openOrder", onOpenOrder);
+        removeListenerSafe(client, "openOrderEnd", onOpenOrderEnd);
+        try { if (typeof client.cancelPositions === "function") client.cancelPositions(); } catch {}
+      };
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (!ok || !this.connected || this.ib !== client || this.accountId !== accountId) {
+          resolve(null);
+          return;
+        }
+        resolve({ accountId, fetchedAtMs: Date.now(), completed: true, positions, openOrders });
+      };
+      const onPosition = (account: unknown, contract: any, quantity: unknown) => {
+        const qty = Number(quantity);
+        if (String(account || "") !== accountId) {
+          // Another account appearing is unsafe to ignore in this single-account bot.
+          finish(false);
+          return;
+        }
+        if (!Number.isFinite(qty) || !contract || !Number.isFinite(Number(contract.conId))) {
+          finish(false); return;
+        }
+        if (qty !== 0) positions.push({
+          account: accountId, conId: Number(contract.conId),
+          symbol: String(contract.symbol || "?"), quantity: qty,
+        });
+      };
+      const onPositionEnd = () => {
+        positionDone = true;
+        if (ordersDone) finish(true);
+      };
+      const onOpenOrder = (id: unknown, contract: any, order: any, state: any) => {
+        if (!Number.isSafeInteger(Number(id)) || !contract || !order) {
+          finish(false); return;
+        }
+        const status = String(state?.status || order?.status || "UNKNOWN");
+        // IBKR openOrder callbacks list working orders. Unknown statuses block.
+        openOrders.push({
+          orderId: Number(id), conId: Number(contract?.conId || 0),
+          symbol: String(contract?.symbol || "?"), status,
+        });
+      };
+      const onOpenOrderEnd = () => {
+        ordersDone = true;
+        if (positionDone) finish(true);
+      };
+      try {
+        client.on("position", onPosition);
+        client.on("positionEnd", onPositionEnd);
+        client.on("openOrder", onOpenOrder);
+        client.on("openOrderEnd", onOpenOrderEnd);
+        timeout = setTimeout(() => finish(false), 6000);
+        if (typeof client.reqPositions !== "function" ||
+            typeof client.reqAllOpenOrders !== "function") {
+          finish(false); return;
+        }
+        client.reqPositions();
+        client.reqAllOpenOrders();
+      } catch {
+        finish(false);
+      }
+    });
+    this.brokerExposureRequest = request;
+    try { return await request; } finally {
+      if (this.brokerExposureRequest === request) this.brokerExposureRequest = null;
+    }
   }
 
   async getAccountSummary(): Promise<IBKRAccountSummary | null> {
