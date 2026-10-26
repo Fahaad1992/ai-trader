@@ -70,7 +70,8 @@ export type SPXRecoveryDecision =
   | { status: "BLOCK_AND_ALERT"; reason: string }
   | { status: "RESUME_MONITORING"; recovered: RecoveredSPXStop };
 
-const workingStatuses = new Set(["SUBMITTED", "PRESUBMITTED", "PENDINGSUBMIT", "APIPENDING"]);
+// PendingSubmit/ApiPending are NOT broker-confirmed working protective orders.
+const workingStatuses = new Set(["SUBMITTED", "PRESUBMITTED"]);
 function validNumber(x: unknown): x is number {
   return typeof x === "number" && Number.isFinite(x);
 }
