@@ -38,3 +38,15 @@ The IBKR client reads *both* broker positions (`reqPositions` + `positionEnd`) a
 Run production compile with `npm run build`. These are **code-level tests, not an IBKR paper gateway integration test**. Before live deployment, validate `reqPositions`, `reqAllOpenOrders` event flows through the installed `ib` library, simulate reconnects and unconfirmed bracket fills, and persist the last known broker-order identifiers.
 
 Live status remains blocked until these broker-integration tests and server deployment are explicitly verified.
+
+
+## Gateway interruption recovery fixes in this branch
+
+- The supervisor checks the local IBKR Gateway socket every 5 seconds and retries reconnection with bounded backoff (5–60 seconds), without placing any trades.
+- Interprets IBKR error 1100/2110 as backend interruption even if the local socket stays up, and 1101 as recovered backend **with lost subscriptions**. On 1101 the SPX/VIX market streams are explicitly re-requested. 1102 means subscriptions were retained. 1300 blocks; update the configured port separately.
+- A routine price refresh must **not** declare recovery complete. The supervisor must verify account identity, completed positions and open-order snapshots, and fresh market data.
+- Account-summary requests capture the original socket, clean up listeners safely after a disconnect, and reject incomplete/timeout snapshots instead of treating synthetic zeros as valid.
+- Existing positions remain at the broker. An unmatched existing broker position is surfaced as a critical warning; its protective stop still requires full contract/order reconstruction, which is not implemented here.
+- Any weekly IBKR Gateway reauthentication is not bypassed; user interaction may be required. Root cause of historical outages remains unverified without PM2/Gateway logs.
+
+This change prevents new orders on a lost/unknown broker session but does NOT promise sub-second execution or uninterrupted Gateway uptime.
