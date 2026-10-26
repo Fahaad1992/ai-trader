@@ -849,6 +849,26 @@ export class TradingEngine {
       await this.refreshBrokerAccountSnapshot();
       const status = market.getIBKRStatus();
       this.log("info", `✅ IBKR متصل! Account: ${market.getIBKRAccountId()} | PRICE_SOURCE=IBKR | EXECUTION=IBKR | MARKET_DATA=${status.requestedMarketDataType}/${status.marketDataMode}`);
+      // Read-only restart audit: local DB can miss an order placed shortly
+      // before a crash. Never assume absence from local DB means no exposure.
+      try {
+        const brokerExposure = await ibkr.getBrokerExposureSnapshot();
+        if (!brokerExposure) {
+          this.log("error", "[IBKR_RESTART_RECONCILIATION_UNKNOWN] Broker position/order snapshot unavailable. New live options orders are blocked at broker entry gate.");
+          try { notifyCriticalError("IBKR recovery", "Could not verify broker positions/orders after restart. No new option entry until IBKR reconciliation succeeds."); } catch {}
+        } else if (brokerExposure.positions.length || brokerExposure.openOrders.length) {
+          const localOpen = this.getOpenTrades().length;
+          this.log("warn", `[IBKR_RESTART_EXPOSURE_FOUND] brokerPositions=${brokerExposure.positions.length} brokerOpenOrders=${brokerExposure.openOrders.length} localOpen=${localOpen} | new options entry blocked pending verified management`);
+          try { notifyCriticalError("IBKR existing exposure", `Detected ${brokerExposure.positions.length} broker positions and ${brokerExposure.openOrders.length} open orders (local DB: ${localOpen}). New options entry blocked; existing broker orders remain unchanged.`); } catch {}
+        } else if (this.getOpenTrades().length > 0) {
+          this.log("warn", `[IBKR_RESTART_LOCAL_BROKER_MISMATCH] localOpen=${this.getOpenTrades().length} broker exposure empty; investigate before trading`);
+          try { notifyCriticalError("IBKR account mismatch", "Local trade records exist but broker shows no open positions/orders. Review before trading."); } catch {}
+        } else {
+          this.log("info", "[IBKR_RESTART_RECONCILIATION_OK] No broker positions, orders, or local open trades at startup");
+        }
+      } catch (reconcileError: any) {
+        this.log("error", `[IBKR_RESTART_RECONCILIATION_FAILED] ${reconcileError?.message || reconcileError}; option entry stays fail-closed`);
+      }
     } else {
       this.ibkrDisconnectAlerted = true;
       this.log("warn", "⚠️ IBKR غير متصل - لا يوجد أي fallback، وسيبقى التداول محظورًا حتى يعود الاتصال الحي" );
