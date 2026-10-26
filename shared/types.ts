@@ -111,6 +111,8 @@ export interface ContractDetails {
   strike?: number;
   expiry?: string;
   contractType?: ContractType | BotOptionSide;
+  optionSide?: BotOptionSide;
+  strategy?: Strategy;
   delta?: number;
   iv?: number;
   volume?: number;
