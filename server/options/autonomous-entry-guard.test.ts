@@ -116,6 +116,11 @@ describe("autonomous SPX candidate preflight (never executes)", () => {
     inp.signal.newsClear = false;
     expect(previewAutonomousSPXEntry(inp).reasons).toContain("SIGNAL_CONFIRMATION_MISSING");
   });
+  it("rejects the obsolete 40% stop policy on entry", () => {
+    const inp = makeInput();
+    inp.limits.initialStopFraction = 0.60;
+    expect(previewAutonomousSPXEntry(inp).reasons).toContain("RISK_LIMITS_NOT_APPROVED");
+  });
   it("blocks invalid account and risk limits", () => {
     const inp = makeInput();
     inp.account.netLiquidationUsd = NaN;
