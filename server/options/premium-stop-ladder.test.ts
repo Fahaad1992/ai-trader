@@ -14,6 +14,9 @@ describe("SPX option premium stop ladder — preview only", () => {
   it("entry $3.00 initializes at stop $1.65", () => {
     expect(createPremiumStopState(3).confirmedStop).toBe(1.65);
   });
+  it("rejects any 40% initial stop policy overriding the shared 45% rule", () => {
+    expect(() => createPremiumStopState(3, { initialStopFraction: 0.60 })).toThrow("SPX_INITIAL_STOP_POLICY_MISMATCH");
+  });
   it("$3.50 raises stop to $3.20 only as a proposal", () => {
     const initial = createPremiumStopState(3);
     const result = previewPremiumStop(initial, quote(3.5), T0 + 1);
