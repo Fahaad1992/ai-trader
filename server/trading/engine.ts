@@ -2115,8 +2115,14 @@ export class TradingEngine {
       return this.rejectOptionQuality(underlying, ct, opt, "SPX_PREMIUM_MISSING: bid/ask unavailable", "spx_premium_missing");
     }
 
-    // Requalify at decision time; timestamps/budget may expire during the scan.
-    const finalAssessment = assessSPXCandidate(opt, budget, Date.now());
+    // Requalify at decision time; both funding snapshot and option ticks
+    // can age out while IBKR scans alternative strikes.
+    const finalBudget = deriveSPXBudget(summary,Date.now());
+    if (!finalBudget.ok) {
+      return this.rejectOptionQuality(underlying,ct,opt,
+        `SPX_BROKER_BUDGET_EXPIRED: ${finalBudget.reason}`,"spx_broker_budget_stale");
+    }
+    const finalAssessment = assessSPXCandidate(opt, finalBudget, Date.now());
     if (!finalAssessment.qualified) {
       return this.rejectOptionQuality(underlying,ct,opt,
         `SPX_FINAL_RISK_REJECT: ${finalAssessment.reasons.join(",")}`,"spx_final_risk_block");
