@@ -860,6 +860,10 @@ export class TradingEngine {
           const localOpen = this.getOpenTrades().length;
           this.log("warn", `[IBKR_RESTART_EXPOSURE_FOUND] brokerPositions=${brokerExposure.positions.length} brokerOpenOrders=${brokerExposure.openOrders.length} localOpen=${localOpen} | new options entry blocked pending verified management`);
           try { notifyCriticalError("IBKR existing exposure", `Detected ${brokerExposure.positions.length} broker positions and ${brokerExposure.openOrders.length} open orders (local DB: ${localOpen}). New options entry blocked; existing broker orders remain unchanged.`); } catch {}
+          if (brokerExposure.positions.length > 0 && brokerExposure.openOrders.length === 0) {
+            this.log("error", "[IBKR_POSSIBLY_UNPROTECTED_POSITION] Broker holds position(s) but has no visible working stop/order. Review urgently; bot will not submit a duplicate entry.");
+            try { notifyCriticalError("IBKR UNPROTECTED POSITION", "IBKR reports open positions but NO visible open orders. Check the positions and protective stops urgently. Bot cannot safely reconstruct the missing order mapping automatically."); } catch {}
+          }
         } else if (this.getOpenTrades().length > 0) {
           this.log("warn", `[IBKR_RESTART_LOCAL_BROKER_MISMATCH] localOpen=${this.getOpenTrades().length} broker exposure empty; investigate before trading`);
           try { notifyCriticalError("IBKR account mismatch", "Local trade records exist but broker shows no open positions/orders. Review before trading."); } catch {}
