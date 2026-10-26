@@ -250,6 +250,16 @@ class IBKRClient {
   // Promises for async operations
   private pendingRequests = new Map<number, { resolve: (data: any) => void; reject: (err: any) => void; timeout: ReturnType<typeof setTimeout> }>();
 
+  private acceptModelOptionGreeks(reqId: number, tickType: number, greeks: unknown): void {
+    const pending = this.pendingRequests.get(reqId);
+    if (pending && tickType === 13) {
+      // The option snapshot's own finish() cancels the deadline after BID,
+      // ASK, volume and greeks are ALL verified. Keep the timer active on
+      // early greeks, even when no quote ever arrives.
+      pending.resolve(greeks);
+    }
+  }
+
   private getNextReqId(): number {
     return this.reqId++;
   }
@@ -547,13 +557,9 @@ class IBKRClient {
         // Option computation (greeks)
         client.on(EventName.tickOptionComputation, (reqId: number, tickType: number, impliedVol: number, delta: number, optPrice: number, pvDividend: number, gamma: number, vega: number, theta: number) => {
           if (this.ib !== client) return;
-          const pending = this.pendingRequests.get(reqId);
-          if (pending && tickType === 13) {
-            // Greeks can arrive BEFORE both bid/ask or volume. Do not clear
-            // the request's timeout until its quote accumulator completes.
-            // Otherwise the 50ms poll remains alive forever on missing ticks.
-            pending.resolve({ iv: impliedVol, delta, gamma, vega, theta, optPrice, pvDividend });
-          }
+          this.acceptModelOptionGreeks(reqId, tickType, {
+            iv: impliedVol, delta, gamma, vega, theta, optPrice, pvDividend,
+          });
         });
 
         // Order status
