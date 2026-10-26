@@ -318,19 +318,19 @@ class IBKRClient {
         client.on(EventName.connected, () => {
           if (this.ib !== client) return;
           console.log("[IBKR] Connected to IB Gateway!");
+          // Socket open is NOT a complete TWS API handshake. Do not mark
+          // connection usable until managedAccounts and nextValidId arrive.
           this.connected = true;
           this.brokerBackendLost = false;
           this.subscriptionsNeedRefresh = false;
           this.connectTime = Date.now();
-          this.connecting = false;
-          this.clearConnectTimeout();
           // Use LIVE market data in live trading, otherwise fall back to DELAYED.
           client.reqMarketDataType(IBKR_MARKET_DATA_TYPE);
           console.log(`[IBKR] Market data type set to ${IBKR_MARKET_DATA_TYPE_LABEL} (${IBKR_MARKET_DATA_TYPE}) for TRADING_MODE=${IBKR_TRADING_MODE}`);
           client.reqCurrentTime();
           client.reqManagedAccts();
           client.reqIds(1);
-          finalize(true);
+          // Both responses are validated in their own callbacks below.
         });
 
         client.on(EventName.disconnected, () => {
@@ -339,7 +339,9 @@ class IBKRClient {
           console.log(`[IBKR] Disconnected from IB Gateway | wasConnected=${this.connected} | uptimeMs=${uptime} | accountId=${this.accountId || "none"} | subscribedTickers=${Array.from(this.tickerReqMap.values()).join(",") || "none"}`);
           const wasConnected = this.connected;
           this.cleanupConnectionState({ disconnectSocket: false });
-          if (!wasConnected) finalize(false);
+          // Important: a disconnect during the handshake must still settle
+          // the pending connect promise; otherwise reconnect hangs forever.
+          finalize(false);
         });
 
         client.on(EventName.error, (err: Error, data?: { id?: number; code?: number }) => {
@@ -426,6 +428,7 @@ class IBKRClient {
           if (this.ib !== client) return;
           this.nextOrderId = orderId;
           console.log(`[IBKR] Next valid order ID: ${orderId}`);
+          if (this.connected && this.accountId && this.nextOrderId > 0) finalize(true);
         });
 
         // Managed accounts
@@ -433,6 +436,7 @@ class IBKRClient {
           if (this.ib !== client) return;
           this.accountId = accountsList.split(",")[0]?.trim() || "";
           console.log(`[IBKR] Account ID: ${this.accountId}`);
+          if (this.connected && this.accountId && this.nextOrderId > 0) finalize(true);
         });
 
         // Current time
@@ -595,8 +599,8 @@ class IBKRClient {
 
         // Timeout
         this.connectTimeout = setTimeout(() => {
-          if (this.ib !== client || this.connected) return;
-          console.error("[IBKR] Connection timeout after 15s");
+          if (this.ib !== client || settled) return;
+          console.error("[IBKR] Connection/handshake timeout after 15s");
           this.cleanupConnectionState({ disconnectSocket: true });
           finalize(false);
         }, 15000);
