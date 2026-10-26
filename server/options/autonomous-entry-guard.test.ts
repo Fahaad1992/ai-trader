@@ -75,7 +75,7 @@ describe("autonomous SPX candidate preflight (never executes)", () => {
   });
   it("blocks delayed quotes even if apparent signal is strong", () => {
     const inp = makeInput();
-    inp.quote.marketDataType = "DELAYED";
+    const delayed = { ...inp, quote: { ...inp.quote, marketDataType: "DELAYED" as const } };
     const d = previewAutonomousSPXEntry(inp);
     expect(d.reasons).toContain("OPTION_QUOTE_NOT_FRESH_LIVE");
   });
@@ -101,8 +101,8 @@ describe("autonomous SPX candidate preflight (never executes)", () => {
   it("blocks wrong contract or right", () => {
     const inp = makeInput();
     inp.contract.symbol = "SPY";
-    inp.signal.right = "PUT";
-    const d = previewAutonomousSPXEntry(inp);
+    const wrongRight = { ...inp, signal: { ...inp.signal, right: "PUT" as const } };
+    const d = previewAutonomousSPXEntry(wrongRight);
     expect(d.reasons).toContain("CONTRACT_NOT_QUALIFIED");
     expect(d.reasons).toContain("SIGNAL_CONTRACT_DIRECTION_MISMATCH");
   });
