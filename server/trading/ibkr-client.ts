@@ -1644,64 +1644,66 @@ class IBKRClient {
   }
 
   async getAccountSummary(): Promise<IBKRAccountSummary | null> {
-    if (!this.connected || !this.ib) return null;
-
+    const client = this.ib;
+    if (!this.isConnected() || !client || !this.accountId) return null;
+    const accountId = this.accountId;
     const reqId = this.getNextReqId();
-    const tags = "NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower";
-
-    return new Promise((resolve) => {
-      const summary: Partial<IBKRAccountSummary> = {
-        accountId: this.accountId,
-        netLiquidation: 0,
-        totalCashValue: 0,
-        availableFunds: 0,
-        buyingPower: 0,
-        currency: "USD",
-        timestamp: Date.now(),
-      };
-
+    const tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower"] as const;
+    return new Promise<IBKRAccountSummary | null>((resolve) => {
+      const data: Record<string, number> = {};
+      let completed = false;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
       const cleanup = () => {
-        clearTimeout(timeout);
-        this.ib!.off(EventName.accountSummary, onSummary);
-        this.ib!.off(EventName.accountSummaryEnd, onEnd);
-        try { this.ib!.cancelAccountSummary(reqId); } catch {}
+        if (timeout) clearTimeout(timeout);
+        removeListenerSafe(client, EventName.accountSummary, onSummary);
+        removeListenerSafe(client, EventName.accountSummaryEnd, onEnd);
+        try { client.cancelAccountSummary(reqId); } catch {}
       };
-
-      const finalize = () => {
+      const finish = (valid: boolean) => {
+        if (completed) return;
+        completed = true;
+        cleanup();
+        if (!valid || !this.isConnected() || this.ib !== client ||
+            this.accountId !== accountId ||
+            !tags.every(tag => Number.isFinite(data[tag]))) {
+          resolve(null);
+          return;
+        }
         const result: IBKRAccountSummary = {
-          accountId: String(summary.accountId || this.accountId || ""),
-          netLiquidation: Number(summary.netLiquidation || 0),
-          totalCashValue: Number(summary.totalCashValue || 0),
-          availableFunds: Number(summary.availableFunds || 0),
-          buyingPower: Number(summary.buyingPower || 0),
-          currency: String(summary.currency || "USD"),
+          accountId,
+          netLiquidation: data.NetLiquidation,
+          totalCashValue: data.TotalCashValue,
+          availableFunds: data.AvailableFunds,
+          buyingPower: data.BuyingPower,
+          currency: "USD",
           timestamp: Date.now(),
         };
         this.lastAccountSummary = result;
-        cleanup();
         resolve(result);
       };
-
-      const onSummary = (incomingReqId: number, account: string, tag: string, value: string, currency: string) => {
-        if (incomingReqId !== reqId) return;
-        summary.accountId = account || summary.accountId || this.accountId;
-        if (currency) summary.currency = currency;
-        const numericValue = Number(value || 0);
-        if (tag === "NetLiquidation") summary.netLiquidation = numericValue;
-        if (tag === "TotalCashValue") summary.totalCashValue = numericValue;
-        if (tag === "AvailableFunds") summary.availableFunds = numericValue;
-        if (tag === "BuyingPower") summary.buyingPower = numericValue;
+      const onSummary = (
+        incomingReqId: number, account: string, tag: string,
+        value: string, currency: string,
+      ) => {
+        if (incomingReqId !== reqId || completed) return;
+        if (account && account !== accountId) { finish(false); return; }
+        if (currency && currency !== "USD") return;
+        if (!tags.some(t => t === tag)) return;
+        const valueNum = Number(value);
+        if (!Number.isFinite(valueNum)) { finish(false); return; }
+        data[tag] = valueNum;
       };
-
       const onEnd = (incomingReqId: number) => {
-        if (incomingReqId !== reqId) return;
-        finalize();
+        if (incomingReqId === reqId) finish(true);
       };
-
-      const timeout = setTimeout(finalize, 10000);
-      this.ib!.on(EventName.accountSummary, onSummary);
-      this.ib!.on(EventName.accountSummaryEnd, onEnd);
-      this.ib!.reqAccountSummary(reqId, "All", tags);
+      try {
+        client.on(EventName.accountSummary, onSummary);
+        client.on(EventName.accountSummaryEnd, onEnd);
+        timeout = setTimeout(() => finish(false), 10000);
+        client.reqAccountSummary(reqId, "All", tags.join(","));
+      } catch {
+        finish(false);
+      }
     });
   }
 
