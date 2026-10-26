@@ -13,6 +13,7 @@ import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat, notifySPXEntry, notifySPXStopUpdate, notifySPXClose } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
 import { roundSPXStop, roundSPXEntry } from "./spx-tick.js";
+import { resolveLongSPXOptionFromTrend } from "./spx-execution-scope.js";
 import { SPX_INITIAL_STOP_LOSS_FRACTION, getSPXInitialPremiumStopRaw } from "../../shared/spx-premium-risk.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
 import { isProtectionReady, classifySilentFailure } from "./live-safety";
@@ -821,7 +822,10 @@ export class TradingEngine {
   }
   async start() {
     if (this.running) return;
-    if (isFuturesMode()) this.logTradeModeGuard("engine start");
+    if (!isSPXOptionsMode()) {
+      this.log("error", "[SPX_ONLY_START_BLOCKED] TRADE_MODE must be spx_options; MES, futures and other symbols forbidden");
+      return;
+    }
 
     if (!market.isConfigured()) {
       this.log("error", "لا يمكن التشغيل: مفتاح API غير موجود");
@@ -1142,7 +1146,7 @@ export class TradingEngine {
       this.logTradeModeGuard("open trade option pricing");
       return;
     }
-    for (const t of this.getOpenTrades()) {
+    for (const t of this.trades.filter(t => t.status === "open")) {
       try {
         const updated = await market.getOptionPrice(t.underlying, t.contractType, t.strike, t.expiry);
         if (updated) {
@@ -1168,6 +1172,12 @@ export class TradingEngine {
 
   // ========== PAPER TRAILING STOP WITH BROKER-SIDE PROTECTION ==========
   private async syncBrokerStop(trade: Trade, newStopPrice: number, trigger: string): Promise<boolean> {
+    if (isSPXOptionsMode()) {
+      // Legacy update creates a NEW stop and cancels the original. That can
+      // duplicate an existing stop after reconnect. Never use for SPX.
+      this.log("error", "[SPX_STOP_AMENDMENT_NOT_VERIFIED] No same-order-ID broker ACK adapter. Existing stop stays unchanged.");
+      return false;
+    }
     const oldStopPrice = trade.trailingStopPrice;
     const oldStopOrderId = this.ibkrStopOrderIds.get(trade.id);
     if (!market.isIBKRConnected()) {
@@ -1412,11 +1422,20 @@ export class TradingEngine {
           const sizeOverride = Math.max(0, Math.min(1, Number(decision.size_override ?? (decision.decision === "EXECUTE" || decision.decision === "REDUCE" ? 1 : 0))));
           const finalSize = (decision.decision === "EXECUTE" || decision.decision === "REDUCE") ? Math.min(sizeOverride, requestedSize, 1) : 0;
           const trendConf = r.confirmations.find(c => c.name === "trend");
-          const optionSide: BotOptionSide | undefined = trendConf?.value?.includes("صاعد") ? "CALL" : "PUT";
+          const spxLongRight = isSPXOptionsMode() ? resolveLongSPXOptionFromTrend(trendConf ?? null) : null;
+          if (isSPXOptionsMode() && !spxLongRight) {
+            this.log("warn", "[SPX_ENTRY_BLOCKED_TREND_UNKNOWN] Neither confirmed CALL nor confirmed PUT. No new position.");
+            continue;
+          }
+          const optionSide: BotOptionSide | undefined = isSPXOptionsMode()
+            ? (spxLongRight === "call" ? "CALL" : "PUT")
+            : trendConf?.value?.includes("صاعد") ? "CALL" : "PUT";
           // ===== BIDIRECTIONAL TRADE SIDE (DRY_RUN-only SHORT) =====
           // LONG = CALL (uptrend). SHORT = PUT (downtrend).
           // SHORT entries are simulated ONLY in DRY_RUN. Live SHORT is hard-blocked.
-          const tradeSide: "LONG" | "SHORT" = optionSide === "CALL" ? "LONG" : "SHORT";
+          const tradeSide: "LONG" | "SHORT" = isSPXOptionsMode()
+            ? "LONG" // Both CALL and PUT are BUY_TO_OPEN. Never naked SHORT.
+            : optionSide === "CALL" ? "LONG" : "SHORT";
           const ENGINE_DRY_RUN = true; // mirror of inner DRY_RUN flag; do not flip without owner approval
           if (isFuturesMode() && tradeSide === "SHORT") {
             if (!ENGINE_DRY_RUN) {
@@ -2047,7 +2066,11 @@ export class TradingEngine {
   private async validateSPXOptionForEntry(conf: Confirmation[]): Promise<OptionQuote | null> {
     const underlying = SPX_UNDERLYING;
     const trendConf = conf.find(c => c.name === "trend");
-    const ct: "call" | "put" = trendConf?.value?.includes("صاعد") ? "call" : "put";
+    const ct = resolveLongSPXOptionFromTrend(trendConf ?? null);
+    if (!ct) {
+      this.log("error", "[SPX_LONG_OPTION_DIRECTION_UNVERIFIED] Block CALL/PUT entry");
+      return null;
+    }
 
     this.log("info", `[SPX_OPTION_VALIDATE] جاري البحث عن ${ct.toUpperCase()} لـ ${underlying} | Delta:${SPX_DELTA_MIN}-${SPX_DELTA_MAX} | MaxPremium:$${SPX_MAX_PREMIUM} | MaxSpread:$${SPX_MAX_SPREAD}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
@@ -2126,7 +2149,11 @@ export class TradingEngine {
     const underlying = SPX_UNDERLYING;
     const s = this.config.activeStrategy as Strategy;
     const trendConf = conf.find(c => c.name === "trend");
-    const ct: ContractType = trendConf?.value?.includes("صاعد") ? "call" : "put";
+    const ct = resolveLongSPXOptionFromTrend(trendConf ?? null);
+    if (!ct) {
+      this.log("error", "[SPX_LONG_OPTION_DIRECTION_UNVERIFIED] Do not choose PUT by default");
+      return;
+    }
     const signal = `${underlying}:${conf.filter(c => c.passed).length}/8`;
     const trace: ExecutionTrace = executionTrace ?? { signalDetectedAt: Date.now() };
 
@@ -3054,6 +3081,11 @@ export class TradingEngine {
   }
 
   private async closeTrade(t: Trade, reason: Trade["closeReason"]) {
+    if (isSPXOptionsMode() && t.dataSource === "ibkr-live") {
+      this.log("error", "[SPX_LIVE_CLOSE_ADAPTER_NOT_VERIFIED] Never cancel a live broker stop or mark a live position closed before confirmed broker fill");
+      try { notifyCriticalError("SPX LIVE CLOSE BLOCKED", "Broker closing / OCA reconciliation adapter is not yet verified. Inspect IBKR position."); } catch {}
+      return;
+    }
     const linkedStopOrderId = this.ibkrStopOrderIds.get(t.id);
     if (linkedStopOrderId && market.isIBKRConnected()) {
       try {
@@ -3238,6 +3270,12 @@ export class TradingEngine {
   }
 
   async closeById(id: string, cp?: number) {
+    if (isSPXOptionsMode()) {
+      // This old UI path CANCELS the protective stop before broker position
+      // close confirmation, leaving exposure unprotected. Block it.
+      this.log("error", "[SPX_MANUAL_CLOSE_UNSAFE] Refuse local-only close; use verified IBKR position close");
+      return;
+    }
     if (isFuturesMode()) {
       this.logTradeModeGuard("manual option close");
       return;

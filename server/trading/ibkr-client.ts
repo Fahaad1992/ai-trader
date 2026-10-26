@@ -4,6 +4,8 @@
  */
 import IB from "ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
+import { verifySPXOptionTick } from "./spx-option-tick-quality.js";
+import { checkLongSPXOrderScope } from "./spx-execution-scope.js";
 import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
 import { checkBrokerEntrySafety } from "./broker-exposure-guard.js";
 
@@ -158,6 +160,8 @@ export interface IBKRStockData {
   close: number;
   volume: number;
   timestamp: number;
+  bidReceivedAtMs?: number;
+  askReceivedAtMs?: number;
 }
 
 export interface IBKROptionData {
@@ -178,6 +182,7 @@ export interface IBKROptionData {
   vega: number;
   iv: number;
   timestamp: number;
+  delayed?: boolean;
 }
 
 export interface IBKROrderResult {
@@ -471,10 +476,12 @@ class IBKRClient {
             case 1:
             case 66:
               existing.bid = price;
+              existing.bidReceivedAtMs = Date.now();
               break;
             case 2:
             case 67:
               existing.ask = price;
+              existing.askReceivedAtMs = Date.now();
               break;
             case 4:
             case 68:
@@ -852,56 +859,59 @@ class IBKRClient {
       tradingClass: contractRow.tradingClass || underlying,
     };
 
-    return new Promise((resolve) => {
+    return new Promise<IBKROptionData | null>((resolve) => {
       let greeks: any = null;
-      const finish = () => {
-        clearTimeout(timeout);
+      let finished = false;
+      let poll: ReturnType<typeof setInterval> | null = null;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const finish = (snapshot: IBKROptionData | null) => {
+        if (finished) return;
+        finished = true;
+        if (timeout) clearTimeout(timeout);
+        if (poll) clearInterval(poll);
         this.pendingRequests.delete(reqId);
-        try { this.ib!.cancelMktData(reqId); } catch {}
-        const priceData = this.stockPrices.get(`OPT_${reqId}`) || { bid: 0, ask: 0, last: 0, volume: 0 };
-        const hasPrice = (priceData.bid || 0) > 0 || (priceData.ask || 0) > 0 || (priceData.last || 0) > 0;
-        if (!hasPrice && !greeks) {
-          resolve(null);
-          return;
-        }
-        resolve({
+        this.tickerReqMap.delete(reqId);
+        this.tickerFeedModes.delete(`OPT_${reqId}`);
+        this.stockPrices.delete(`OPT_${reqId}`);
+        try { this.ib?.cancelMktData(reqId); } catch {}
+        resolve(snapshot);
+      };
+      const maybeResolve = () => {
+        const priceData = this.stockPrices.get(`OPT_${reqId}`);
+        if (!priceData || !greeks || !Number.isFinite(greeks.delta) || greeks.delta === 0) return;
+        const verdict = verifySPXOptionTick({
+          bid: priceData.bid, ask: priceData.ask,
+          bidReceivedAtMs: priceData.bidReceivedAtMs,
+          askReceivedAtMs: priceData.askReceivedAtMs,
+          marketDataMode: this.tickerFeedModes.get(`OPT_${reqId}`) || "unknown",
+        }, Date.now());
+        if (!verdict.ok) return;
+        finish({
           ticker: `${underlying}${normalizedExpiry}${type === "call" ? "C" : "P"}${resolvedStrike}`,
-          underlying,
-          type,
-          strike: resolvedStrike,
-          expiry: normalizedExpiry,
-          bid: priceData.bid || 0,
-          ask: priceData.ask || 0,
-          mid: priceData.bid && priceData.ask ? (priceData.bid + priceData.ask) / 2 : 0,
-          last: priceData.last || 0,
-          volume: priceData.volume || 0,
-          openInterest: 0,
-          delta: greeks?.delta || 0,
-          gamma: greeks?.gamma || 0,
-          theta: greeks?.theta || 0,
-          vega: greeks?.vega || 0,
-          iv: greeks?.iv || 0,
-          timestamp: Date.now(),
+          underlying, type, strike: resolvedStrike, expiry: normalizedExpiry,
+          bid: verdict.bid, ask: verdict.ask,
+          mid: (verdict.bid + verdict.ask) / 2,
+          last: priceData.last || 0, volume: priceData.volume || 0,
+          openInterest: 0, delta: greeks.delta,
+          gamma: greeks.gamma || 0, theta: greeks.theta || 0,
+          vega: greeks.vega || 0, iv: greeks.iv || 0,
+          timestamp: verdict.timestampMs, delayed: false,
         });
       };
-
-      const timeout = setTimeout(() => finish(), 12000);
-
+      // Enforce a bounded quote interval. No fabricated timestamp at timeout.
+      timeout = setTimeout(() => finish(null), 2500);
+      poll = setInterval(maybeResolve, 50);
       this.pendingRequests.set(reqId, {
-        resolve: (data: any) => {
-          greeks = data || greeks;
-        },
-        reject: () => {
-          clearTimeout(timeout);
-          this.pendingRequests.delete(reqId);
-          try { this.ib!.cancelMktData(reqId); } catch {}
-          resolve(null);
-        },
+        resolve: (data: any) => { greeks = data || greeks; maybeResolve(); },
+        reject: () => finish(null),
         timeout,
       });
-
       this.tickerReqMap.set(reqId, `OPT_${reqId}`);
-      this.ib!.reqMktData(reqId, contract, "100,101,104,106", false, false);
+      try {
+        this.ib!.reqMktData(reqId, contract, "100,101,104,106", false, false);
+      } catch {
+        finish(null);
+      }
     });
   }
 
@@ -916,9 +926,7 @@ class IBKRClient {
     symbol: string,
     contractMonth: string,
   ): Contract {
-    if (isSPXOptionsMode()) {
-      throw new Error("[MES_FUTURES_DISABLED_SPX_ONLY] buildFuturesContract blocked: SPX Options mode does not use FUT contracts");
-    }
+    throw new Error("FUTURES_CONTRACT_CONSTRUCTION_DISABLED_SPX_ONLY");
     return {
       symbol,
       secType: SecType.FUT,
@@ -945,9 +953,9 @@ class IBKRClient {
     stopLossPrice: number,
     targetPrice?: number,
   ): Promise<IBKROrderResult | null> {
-    if (isSPXOptionsMode()) {
-      console.warn("[MES_FUTURES_DISABLED_SPX_ONLY] placeFuturesBracket blocked: SPX Options mode does not use FUT bracket orders");
-      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0, avgFillPrice: 0, lastFillPrice: 0, rejectReason: "MES_FUTURES_DISABLED_SPX_ONLY", errorMessage: "placeFuturesBracket blocked in SPX Options mode" } as IBKROrderResult;
+    if (true) {
+      console.warn("[FUTURES_ORDERS_DISABLED] placeFuturesBracket is disabled in every trade mode");
+      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0, avgFillPrice: 0, lastFillPrice: 0, rejectReason: "FUTURES_ORDERS_DISABLED", errorMessage: "Futures trading not permitted in SPX-only bot" } as IBKROrderResult;
     }
     if (!this.connected || !this.ib) return null;
     if (!symbol || typeof symbol !== "string") {
@@ -1092,8 +1100,11 @@ class IBKRClient {
     quantity: number,
     limitPrice?: number
   ): Promise<IBKROrderResult | null> {
-    if (!this.connected || !this.ib) return null;
-
+    // Generic BUY or SELL cannot prove long-only SPX intent or position to
+    // close. Never allow a naked SELL / another symbol through this path.
+    return { orderId:-1, status:"Rejected", filled:0, remaining:0,
+      avgFillPrice:0, lastFillPrice:0,
+      rejectReason:"GENERIC_ORDER_PATH_DISABLED_SPX_ONLY" };
     const orderId = this.nextOrderId++;
     const contract = this.buildOptionContract(underlying, type, strike, expiry);
 
@@ -1132,8 +1143,11 @@ class IBKRClient {
     quantity: number,
     stopLossPrice: number
   ): Promise<IBKROrderResult | null> {
-    if (!this.connected || !this.ib) return null;
-
+    // Standalone SELL stops can duplicate a stop after an outage; only a
+    // verified amendment of an existing broker stop may be used later.
+    return { orderId:-1, status:"Rejected", filled:0, remaining:0,
+      avgFillPrice:0, lastFillPrice:0,
+      rejectReason:"STANDALONE_STOP_PATH_DISABLED_SPX_ONLY" };
     const orderId = this.nextOrderId++;
     const contract = this.buildOptionContract(underlying, type, strike, expiry);
     const order: Order = {
@@ -1176,6 +1190,7 @@ class IBKRClient {
     quantity: number,
     newAuxPrice: number,
   ): Promise<{ ok: boolean; status: string; permId?: number; reason?: string }> {
+    return { ok: false, status: "FUTURES_DISABLED", reason: "Futures stop modification is not permitted in SPX-only bot" };
     if (!this.connected || !this.ib) return { ok: false, status: "not_connected", reason: "ibkr_not_connected" };
     if (!stopOrderId || stopOrderId <= 0) return { ok: false, status: "bad_id", reason: "missing_stopOrderId" };
     if (!/^[0-9]{6}$/.test(String(contractMonth || ""))) return { ok: false, status: "bad_month", reason: "invalid_contractMonth" };
@@ -1242,7 +1257,22 @@ class IBKRClient {
         errorMessage: msg,
       } as IBKROrderResult;
     }
-    if (!this.connected || !this.ib) return null;
+    if (!isSPXOptionsMode()) {
+      return { orderId:-1,status:"Rejected",filled:0,remaining:0,avgFillPrice:0,
+        lastFillPrice:0,rejectReason:"SPX_ONLY_RUNTIME_MODE_REQUIRED" };
+    }
+    const scope = checkLongSPXOrderScope({ underlying, secType:"OPT",
+      right: type === "call" ? "C" : type === "put" ? "P" : "INVALID",
+      action:"BUY", quantity, multiplier:100, exchange:"SMART" });
+    if (!scope.allowed || !Number.isFinite(strike) || strike <= 0 ||
+        !/^\d{4}-?\d{2}-?\d{2}$/.test(expiry) ||
+        !Number.isFinite(entryLimitPrice) || entryLimitPrice <= 0 ||
+        !Number.isFinite(stopLossPrice) || stopLossPrice <= 0 ||
+        stopLossPrice >= entryLimitPrice) {
+      return { orderId:-1,status:"Rejected",filled:0,remaining:0,avgFillPrice:0,
+        lastFillPrice:0,rejectReason:scope.allowed ? "SPX_BRACKET_INPUT_INVALID" : scope.reason };
+    }
+    if (!this.isConnected() || !this.ib) return null;
     if (this.optionEntryInFlight) {
       return { orderId: -1, status: "Rejected", filled: 0, remaining: 0,
         avgFillPrice: 0, lastFillPrice: 0, rejectReason: "IBKR_OPTION_ENTRY_ALREADY_IN_FLIGHT" };
@@ -1418,6 +1448,9 @@ class IBKRClient {
     contract: Contract,
     quantity: number
   ): Promise<{ ok: boolean; status: string; detail: string }> {
+    // The old method could return MODIFY_SUBMITTED without confirming a
+    // broker-side stop amendment. It is unsafe for SPX recovery.
+    return { ok:false, status:"SPX_STOP_AMENDMENT_UNVERIFIED", detail:"Broker ACK and persistent matching adapter not yet installed" };
     if (!this.connected || !this.ib) {
       return { ok: false, status: "NOT_CONNECTED", detail: "IBKR not connected" };
     }

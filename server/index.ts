@@ -1,5 +1,5 @@
 import "dotenv/config";
-import express, { type Request } from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import crypto from "crypto";
 import path from "path";
@@ -8,7 +8,7 @@ import { engine } from "./trading/engine.js";
 import { getMarketStatus, market } from "./trading/market-data.js";
 import { ibkr } from "./trading/ibkr-client.js";
 import { createTradingViewWebhookEvent, finalizeTradingViewWebhookEvent, loadTradingViewWebhookEvent, saveLog } from "./trading/database.js";
-import { isFuturesMode } from "./trading/trade-mode.js";
+import { isFuturesMode, isSPXOptionsMode } from "./trading/trade-mode.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -17,8 +17,8 @@ app.use(cors());
 app.use(express.json());
 
 const TV_WEBHOOK_SECRET = process.env.TV_WEBHOOK_SECRET || "";
-const TV_ALLOWED_SYMBOL = "MES";
-const TV_ALLOWED_ACTIONS = new Set(["BUY", "SELL"]);
+const TV_ALLOWED_SYMBOL = "SPX";
+const TV_ALLOWED_ACTIONS = new Set(["CALL", "PUT"]); // long option direction, NEVER a short-selling instruction
 const TV_WEBHOOK_RATE_LIMIT_WINDOW_MS = 60_000;
 const TV_WEBHOOK_RATE_LIMIT_MAX_REQUESTS = 20;
 const TV_WEBHOOK_BRAIN_TIMEOUT_MS = 2500;
@@ -30,6 +30,25 @@ function secureSecretEquals(a: string, b: string) {
   const bBuf = Buffer.from(b);
   if (aBuf.length !== bBuf.length) return false;
   return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+/**
+ * Operator-control routes must not be world-writable. No configured secret
+ * means no mutation endpoint works (fail closed); health/read views remain.
+ * Required outside TradingView, which has its own independent secret.
+ */
+function requireOperatorAuthorization(req: Request, res: Response, next: NextFunction) {
+  const token = String(process.env.BOT_CONTROL_TOKEN || "");
+  if (token.length < 32) {
+    res.status(503).json({ ok: false, error: "BOT_CONTROL_DISABLED_MISSING_STRONG_TOKEN" });
+    return;
+  }
+  const provided = String(req.header("authorization") || "");
+  if (!secureSecretEquals(provided, "Bearer " + token)) {
+    res.status(401).json({ ok: false, error: "UNAUTHORIZED_BOT_CONTROL" });
+    return;
+  }
+  next();
 }
 
 function consumeWebhookRateLimit(secret: string) {
@@ -233,8 +252,14 @@ function evaluateExecutionBridge(input: {
 
 // API routes
 app.get("/api/bot/status", (_req, res) => res.json(engine.getStatus()));
-app.post("/api/bot/start", async (_req, res) => { await engine.start(); res.json({ ok: true }); });
-app.post("/api/bot/stop", (_req, res) => { engine.stop(); res.json({ ok: true }); });
+app.post("/api/bot/start", requireOperatorAuthorization, async (_req, res) => {
+  await engine.start();
+  const running = engine.getStatus().running;
+  res.status(running ? 200 : 409).json({
+    ok: running, running, reason: running ? undefined : "SPX_BOT_START_BLOCKED_NOT_READY",
+  });
+});
+app.post("/api/bot/stop", requireOperatorAuthorization, (_req, res) => { engine.stop(); res.json({ ok: true }); });
 app.get("/api/bot/logs", (req, res) => {
   const limit = Number(req.query.limit) || 50;
   const level = typeof req.query.level === "string" ? req.query.level : undefined;
@@ -246,13 +271,20 @@ app.get("/api/bot/logs", (req, res) => {
 app.get("/api/bot/last-errors", (req, res) => res.json(engine.getLastErrors(Number(req.query.limit) || 20)));
 app.get("/api/trades/open", (_req, res) => res.json(engine.getOpenTrades()));
 app.get("/api/trades/closed", (_req, res) => res.json(engine.getClosedTrades()));
-app.post("/api/trades/close", async (req, res) => { await engine.closeById(req.body.tradeId, req.body.currentPremium); res.json({ ok: true }); });
+app.post("/api/trades/close", requireOperatorAuthorization, async (req, res) => {
+  if (isSPXOptionsMode()) {
+    res.status(409).json({ ok:false, error:"SPX_LOCAL_CLOSE_DISABLED_USE_VERIFIED_BROKER_POSITION_CLOSE" });
+    return;
+  }
+  await engine.closeById(req.body.tradeId, req.body.currentPremium);
+  res.json({ ok:true });
+});
 app.get("/api/stats/daily", (_req, res) => res.json(engine.getDailyStats()));
 app.get("/api/stats/overall", (_req, res) => res.json(engine.getOverallStats()));
 app.get("/api/stats/history", (_req, res) => res.json(engine.getHistory()));
 app.get("/api/stats/smart-brain", (_req, res) => res.json(engine.getSmartBrainStats()));
 app.get("/api/config", (_req, res) => res.json(engine.getConfig()));
-app.put("/api/config", (req, res) => { engine.updateConfig(req.body); res.json({ ok: true }); });
+app.put("/api/config", requireOperatorAuthorization, (req, res) => { engine.updateConfig(req.body); res.json({ ok: true }); });
 
 // Market status endpoint
 app.get("/api/market/status", (_req, res) => {
@@ -276,7 +308,7 @@ app.get("/api/ibkr/status", (_req, res) => {
     status: ibkr.getStatus(),
   });
 });
-app.post("/api/ibkr/connect", async (_req, res) => {
+app.post("/api/ibkr/connect", requireOperatorAuthorization, async (_req, res) => {
   const connected = await market.connectIBKR();
   res.json({ connected, accountId: market.getIBKRAccountId() });
 });
@@ -299,7 +331,8 @@ app.get("/api/ibkr/spy-chain", async (_req, res) => {
 
 app.post("/api/webhook/tradingview", async (req, res) => {
   const body = (req.body && typeof req.body === "object") ? req.body as Record<string, unknown> : {};
-  const payloadJson = toSafeJson(body);
+  // Webhook body includes a secret. Never persist it in SQLite error logs.
+  const payloadJson = toSafeJson({ ...body, secret: "[REDACTED]" });
   const providedSecret = asTrimmedString(body.secret);
 
   if (!TV_WEBHOOK_SECRET) {

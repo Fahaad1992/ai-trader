@@ -709,6 +709,13 @@ export class MarketDataProvider {
     strike: number,
     expiry: string
   ): Promise<OptionQuote | null> {
+    if (isSPXOptionsMode() || underlying.toUpperCase() === "SPX") {
+      // No Polygon or index-price proxy for monitoring an actual SPX option.
+      // A verified persistent IBKR option-BID subscription is still missing.
+      // Return NO quote rather than invent a price/stop update.
+      console.error("[SPX_OPTION_MONITORING_BLOCKED] No verified IBKR live option-BID streaming monitor installed");
+      return null;
+    }
     if (!POLYGON_ENABLED) {
       console.error(`[DATA_BLOCK] ${underlying}: Polygon unavailable for option pricing | source=none | ibkrConnected=${this.isIBKRConnected()} | polygonAvailable=false | yahooFallbackUsed=false`);
       return null;
@@ -807,7 +814,12 @@ export class MarketDataProvider {
         continue;
       }
       const snap = r.value;
-      if (!(snap.bid > 0) || !(snap.ask > 0)) continue;
+      // The returned contract must be the requested contract, not the
+      // nearest strike silently substituted by an underlying chain lookup.
+      if (snap.strike !== snap._strike || snap.expiry !== snap._expiry) continue;
+      if (snap.delayed !== false || !Number.isFinite(snap.timestamp) ||
+          snap.timestamp > Date.now() || Date.now() - snap.timestamp > 2_000) continue;
+      if (!(snap.bid > 0) || !(snap.ask > 0) || snap.ask < snap.bid) continue;
 
       const premium = snap.ask;
       if (premium < premiumRange[0] || premium > premiumRange[1]) continue;
@@ -836,7 +848,7 @@ export class MarketDataProvider {
         moneyness: Math.abs(snap._strike - spxPrice) < strikeInterval ? "ATM" : (type === "call" ? (snap._strike < spxPrice ? "ITM" : "OTM") : (snap._strike > spxPrice ? "ITM" : "OTM")),
         source: "ibkr" as const,
         timestamp: snap.timestamp || 0,
-        delayed: false,
+        delayed: snap.delayed !== false,
       });
     }
 

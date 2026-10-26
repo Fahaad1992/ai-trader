@@ -15,6 +15,34 @@ const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
 
+
+
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS trades (
+  id TEXT PRIMARY KEY,
+  mode TEXT,
+  strategy TEXT,
+  underlying TEXT,
+  symbol TEXT,
+  contract_type TEXT,
+  strike REAL,
+  expiry TEXT,
+  entry_premium REAL,
+  exit_premium REAL,
+  quantity INTEGER,
+  delta REAL,
+  pnl REAL,
+  pnl_percent REAL,
+  status TEXT,
+  open_reason TEXT,
+  close_reason TEXT,
+  opened_at INTEGER,
+  closed_at INTEGER,
+  data_source TEXT
+);
+`);
+
 // === OBSERVABILITY_MIGRATION_v1 ===
 try {
   const _existing = (db.prepare("PRAGMA table_info(trades)").all() as any[]).map(r => r.name);
@@ -61,31 +89,6 @@ try {
 }
 // === /OBSERVABILITY_MIGRATION_v1 ===
 
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS trades (
-  id TEXT PRIMARY KEY,
-  mode TEXT,
-  strategy TEXT,
-  underlying TEXT,
-  symbol TEXT,
-  contract_type TEXT,
-  strike REAL,
-  expiry TEXT,
-  entry_premium REAL,
-  exit_premium REAL,
-  quantity INTEGER,
-  delta REAL,
-  pnl REAL,
-  pnl_percent REAL,
-  status TEXT,
-  open_reason TEXT,
-  close_reason TEXT,
-  opened_at INTEGER,
-  closed_at INTEGER,
-  data_source TEXT
-);
-`);
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS logs (
