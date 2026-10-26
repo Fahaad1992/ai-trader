@@ -6,7 +6,7 @@
 import type { Trade, BotConfig, BotStatus, BotLog, DailyStats, OverallStats, DailyHistory, Confirmation, Strategy, ContractType, TrailingConfig, SmartBrainStatsReport, DecisionStatsWindow, BotDecision, BotOptionSide } from "../../shared/types.js";
 import { market, isMarketOpen, getMarketStatus, type OptionQuote, type StockData } from "./market-data.js";
 import { ibkr } from "./ibkr-client.js";
-import { saveTrade, closeTrade as dbCloseTrade, loadOpenTrades, loadAllTrades, saveLog, saveDailyStats, loadLogs, loadErrorLogs, loadLogsSince, loadSavedSPXStop } from "./database.js";
+import { saveTrade, closeTrade as dbCloseTrade, loadOpenTrades, loadAllTrades, saveLog, saveDailyStats, loadLogs, loadErrorLogs, loadLogsSince, loadSavedSPXStop, saveVerifiedSPXStop } from "./database.js";
 import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
 import { reconcileSPXStop, type RecoveredSPXStop, type RecoveryBrokerSnapshot } from "../options/stop-recovery.js";
 import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
@@ -994,6 +994,9 @@ export class TradingEngine {
       } : null;
       const result = reconcileSPXStop(saved, broker, String(process.env.IBKR_REQUIRED_ACCOUNT_ID || ""), Date.now());
       if (result.status === "RESUME_MONITORING") {
+        // The broker may already have a HIGHER stop than the stale journal.
+        // Persist broker-confirmed protection only, never a local proposal.
+        saveVerifiedSPXStop({ ...result.recovered.saved, recordedAtMs: Date.now() });
         this.recoveredSPXStop = result.recovered;
         this.log("info", `[SPX_STOP_RECOVERED_VERIFIED] brokerConId=${result.recovered.saved.conId} stopOrderId=${result.recovered.activeStopOrderId} confirmedStop=${result.recovered.stopPriceAtBroker} peakBid=${result.recovered.stopState.peakBid} | read-only until execution adapter is proven`);
       } else if (result.status === "FLAT") {
