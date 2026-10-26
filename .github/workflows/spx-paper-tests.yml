@@ -28,3 +28,5 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Run isolated preview tests
         run: npx vitest run shared/spx-premium-risk.test.ts server/options/premium-stop-ladder.test.ts server/options/autonomous-entry-guard.test.ts server/options/paper-event-engine.test.ts
+      - name: Production bundle build (no runtime start)
+        run: npm run build
