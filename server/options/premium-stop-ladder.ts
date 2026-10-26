@@ -1,3 +1,4 @@
+import { SPX_INITIAL_STOP_RETAINED_FRACTION } from "../../shared/spx-premium-risk.js";
 /**
  * SPX / equity option premium risk policy, independent of the futures engine.
  *
@@ -17,7 +18,7 @@ export interface PremiumStopConfig {
   maxQuoteAgeMs: number;
 }
 export const DEFAULT_PREMIUM_STOP_CONFIG: Readonly<PremiumStopConfig> = Object.freeze({
-  initialStopFraction: 0.55,
+  initialStopFraction: SPX_INITIAL_STOP_RETAINED_FRACTION,
   firstTrigger: 0.50,
   firstProtectedGain: 0.20,
   secondTrigger: 1.00,
@@ -59,6 +60,9 @@ function resolveConfig(overrides: Partial<PremiumStopConfig>): PremiumStopConfig
   const config = { ...DEFAULT_PREMIUM_STOP_CONFIG, ...overrides };
   for (const key of ["firstTrigger", "secondTrigger", "breakoutTrigger", "continuationStep", "tickSize", "maxQuoteAgeMs"] as const) {
     requireFinitePositive(config[key], key);
+  }
+  if (config.initialStopFraction !== SPX_INITIAL_STOP_RETAINED_FRACTION) {
+    throw new Error("SPX_INITIAL_STOP_POLICY_MISMATCH");
   }
   if (!Number.isFinite(config.initialStopFraction) || config.initialStopFraction <= 0 || config.initialStopFraction >= 1) {
     throw new Error("INITIAL_STOP_FRACTION_INVALID");
