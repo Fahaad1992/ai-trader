@@ -5,6 +5,8 @@
  * when the bot's local SQLite database appears to have no open trades.
  * A disconnected or partially delivered snapshot must NEVER become "empty".
  */
+import { SPX_OPTION_SELECTION } from "./spx-contract-selection.js";
+
 export interface BrokerExposureSnapshot {
   accountId: string;
   fetchedAtMs: number;
@@ -70,7 +72,7 @@ export function checkBrokerEntrySafety(input: BrokerEntryGateInput): BrokerEntry
   const reasons: string[] = [];
   const exposureAge = input.maxExposureSnapshotAgeMs ?? 2000;
   const balanceAge = input.maxBalanceSnapshotAgeMs ?? 5000;
-  const feeReserve = input.minimumFeesReserveUsd ?? 5;
+  const feeReserve = input.minimumFeesReserveUsd ?? SPX_OPTION_SELECTION.minimumFeesReserveUsd;
   const cost = input.entryPremium * input.quantity * input.multiplier;
   if (!input.brokerConnected) reasons.push("BROKER_DISCONNECTED");
   if (!input.configuredAccountId.trim() || !input.connectedAccountId.trim() ||
