@@ -6,6 +6,8 @@ on:
       - chatgpt/options-premium-ladder-preview-20261026
     paths:
       - server/options/**
+      - shared/spx-premium-risk.ts
+      - shared/spx-premium-risk.test.ts
       - .github/workflows/spx-paper-tests.yml
   workflow_dispatch:
 
@@ -25,4 +27,4 @@ jobs:
       - name: Install dependencies without running native hooks
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Run isolated preview tests
-        run: npx vitest run server/options/premium-stop-ladder.test.ts server/options/autonomous-entry-guard.test.ts server/options/paper-event-engine.test.ts
+        run: npx vitest run shared/spx-premium-risk.test.ts server/options/premium-stop-ladder.test.ts server/options/autonomous-entry-guard.test.ts server/options/paper-event-engine.test.ts
