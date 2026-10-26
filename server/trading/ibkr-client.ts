@@ -5,6 +5,7 @@
 import IB from "ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
 import { verifySPXOptionTick } from "./spx-option-tick-quality.js";
+import { checkLongSPXOrderScope } from "./spx-execution-scope.js";
 import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
 import { checkBrokerEntrySafety } from "./broker-exposure-guard.js";
 
@@ -925,9 +926,7 @@ class IBKRClient {
     symbol: string,
     contractMonth: string,
   ): Contract {
-    if (isSPXOptionsMode()) {
-      throw new Error("[MES_FUTURES_DISABLED_SPX_ONLY] buildFuturesContract blocked: SPX Options mode does not use FUT contracts");
-    }
+    throw new Error("FUTURES_CONTRACT_CONSTRUCTION_DISABLED_SPX_ONLY");
     return {
       symbol,
       secType: SecType.FUT,
@@ -954,9 +953,9 @@ class IBKRClient {
     stopLossPrice: number,
     targetPrice?: number,
   ): Promise<IBKROrderResult | null> {
-    if (isSPXOptionsMode()) {
-      console.warn("[MES_FUTURES_DISABLED_SPX_ONLY] placeFuturesBracket blocked: SPX Options mode does not use FUT bracket orders");
-      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0, avgFillPrice: 0, lastFillPrice: 0, rejectReason: "MES_FUTURES_DISABLED_SPX_ONLY", errorMessage: "placeFuturesBracket blocked in SPX Options mode" } as IBKROrderResult;
+    if (true) {
+      console.warn("[FUTURES_ORDERS_DISABLED] placeFuturesBracket is disabled in every trade mode");
+      return { orderId: -1, status: "Rejected", filled: 0, remaining: 0, avgFillPrice: 0, lastFillPrice: 0, rejectReason: "FUTURES_ORDERS_DISABLED", errorMessage: "Futures trading not permitted in SPX-only bot" } as IBKROrderResult;
     }
     if (!this.connected || !this.ib) return null;
     if (!symbol || typeof symbol !== "string") {
@@ -1101,8 +1100,11 @@ class IBKRClient {
     quantity: number,
     limitPrice?: number
   ): Promise<IBKROrderResult | null> {
-    if (!this.connected || !this.ib) return null;
-
+    // Generic BUY or SELL cannot prove long-only SPX intent or position to
+    // close. Never allow a naked SELL / another symbol through this path.
+    return { orderId:-1, status:"Rejected", filled:0, remaining:0,
+      avgFillPrice:0, lastFillPrice:0,
+      rejectReason:"GENERIC_ORDER_PATH_DISABLED_SPX_ONLY" };
     const orderId = this.nextOrderId++;
     const contract = this.buildOptionContract(underlying, type, strike, expiry);
 
@@ -1141,8 +1143,11 @@ class IBKRClient {
     quantity: number,
     stopLossPrice: number
   ): Promise<IBKROrderResult | null> {
-    if (!this.connected || !this.ib) return null;
-
+    // Standalone SELL stops can duplicate a stop after an outage; only a
+    // verified amendment of an existing broker stop may be used later.
+    return { orderId:-1, status:"Rejected", filled:0, remaining:0,
+      avgFillPrice:0, lastFillPrice:0,
+      rejectReason:"STANDALONE_STOP_PATH_DISABLED_SPX_ONLY" };
     const orderId = this.nextOrderId++;
     const contract = this.buildOptionContract(underlying, type, strike, expiry);
     const order: Order = {
@@ -1185,6 +1190,7 @@ class IBKRClient {
     quantity: number,
     newAuxPrice: number,
   ): Promise<{ ok: boolean; status: string; permId?: number; reason?: string }> {
+    return { ok: false, status: "FUTURES_DISABLED", reason: "Futures stop modification is not permitted in SPX-only bot" };
     if (!this.connected || !this.ib) return { ok: false, status: "not_connected", reason: "ibkr_not_connected" };
     if (!stopOrderId || stopOrderId <= 0) return { ok: false, status: "bad_id", reason: "missing_stopOrderId" };
     if (!/^[0-9]{6}$/.test(String(contractMonth || ""))) return { ok: false, status: "bad_month", reason: "invalid_contractMonth" };
@@ -1251,7 +1257,22 @@ class IBKRClient {
         errorMessage: msg,
       } as IBKROrderResult;
     }
-    if (!this.connected || !this.ib) return null;
+    if (!isSPXOptionsMode()) {
+      return { orderId:-1,status:"Rejected",filled:0,remaining:0,avgFillPrice:0,
+        lastFillPrice:0,rejectReason:"SPX_ONLY_RUNTIME_MODE_REQUIRED" };
+    }
+    const scope = checkLongSPXOrderScope({ underlying, secType:"OPT",
+      right: type === "call" ? "C" : type === "put" ? "P" : "INVALID",
+      action:"BUY", quantity, multiplier:100, exchange:"SMART" });
+    if (!scope.allowed || !Number.isFinite(strike) || strike <= 0 ||
+        !/^\\d{4}-?\\d{2}-?\\d{2}$/.test(expiry) ||
+        !Number.isFinite(entryLimitPrice) || entryLimitPrice <= 0 ||
+        !Number.isFinite(stopLossPrice) || stopLossPrice <= 0 ||
+        stopLossPrice >= entryLimitPrice) {
+      return { orderId:-1,status:"Rejected",filled:0,remaining:0,avgFillPrice:0,
+        lastFillPrice:0,rejectReason:scope.allowed ? "SPX_BRACKET_INPUT_INVALID" : scope.reason };
+    }
+    if (!this.isConnected() || !this.ib) return null;
     if (this.optionEntryInFlight) {
       return { orderId: -1, status: "Rejected", filled: 0, remaining: 0,
         avgFillPrice: 0, lastFillPrice: 0, rejectReason: "IBKR_OPTION_ENTRY_ALREADY_IN_FLIGHT" };
@@ -1427,6 +1448,9 @@ class IBKRClient {
     contract: Contract,
     quantity: number
   ): Promise<{ ok: boolean; status: string; detail: string }> {
+    // The old method could return MODIFY_SUBMITTED without confirming a
+    // broker-side stop amendment. It is unsafe for SPX recovery.
+    return { ok:false, status:"SPX_STOP_AMENDMENT_UNVERIFIED", detail:"Broker ACK and persistent matching adapter not yet installed" };
     if (!this.connected || !this.ib) {
       return { ok: false, status: "NOT_CONNECTED", detail: "IBKR not connected" };
     }
