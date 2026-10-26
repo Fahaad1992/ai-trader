@@ -213,6 +213,10 @@ export interface IBKRAccountSummary {
 class IBKRClient {
   private ib: IBApi | null = null;
   private connected = false;
+  // IBKR error 1100/2110 can lose broker connectivity WITHOUT dropping the
+  // local Gateway socket. 1101 specifically invalidates live data subscriptions.
+  private brokerBackendLost = false;
+  private subscriptionsNeedRefresh = false;
   private connecting = false;
   private connectTime = 0;
   private nextOrderId = 0;
@@ -271,6 +275,8 @@ class IBKRClient {
 
     this.ib = null;
     this.connected = false;
+    this.brokerBackendLost = false;
+    this.subscriptionsNeedRefresh = false;
     this.connecting = false;
     this.connectPromise = null;
     this.accountId = "";
@@ -283,7 +289,7 @@ class IBKRClient {
   }
 
   async connect(): Promise<boolean> {
-    if (this.connected && this.ib) return true;
+    if (this.connected && this.ib) return !this.brokerBackendLost;
     if (this.connectPromise) return this.connectPromise;
 
     if (this.ib) {
@@ -313,6 +319,8 @@ class IBKRClient {
           if (this.ib !== client) return;
           console.log("[IBKR] Connected to IB Gateway!");
           this.connected = true;
+          this.brokerBackendLost = false;
+          this.subscriptionsNeedRefresh = false;
           this.connectTime = Date.now();
           this.connecting = false;
           this.clearConnectTimeout();
@@ -340,6 +348,24 @@ class IBKRClient {
           const reqId = Number(data?.id ?? -1);
           const errorMessage = err?.message || String(err);
           const msg = `[IBKR] Error: ${errorMessage} (code: ${code}, reqId: ${reqId})`;
+          if (code === 1100 || code === 2110 || code === 1300) {
+            this.brokerBackendLost = true;
+            this.latestMarketDataMode = "unknown";
+            console.error(`[IBKR_BACKEND_LOST] code=${code}, entries suspended pending verified connection`);
+          } else if (code === 1101) {
+            this.brokerBackendLost = false;
+            this.subscriptionsNeedRefresh = true;
+            this.latestMarketDataMode = "unknown";
+            this.tickerReqMap.clear();
+            this.tickerFeedModes.clear();
+            this.stockPrices.clear();
+            console.warn("[IBKR_DATA_LOST_1101] Market subscriptions invalidated; resubscription required");
+          } else if (code === 1102) {
+            this.brokerBackendLost = false;
+            this.subscriptionsNeedRefresh = false;
+            console.log("[IBKR_DATA_RETAINED_1102] Backend restored; subscriptions retained");
+          }
+
 
           if (isIgnorableIbInfoCode(code)) {
             console.log(`[IBKR] Info: ${errorMessage}`);
@@ -590,7 +616,15 @@ class IBKRClient {
   }
 
   isConnected(): boolean {
-    return this.connected;
+    return this.connected && !this.brokerBackendLost && !this.subscriptionsNeedRefresh;
+  }
+
+  needsMarketResubscription(): boolean {
+    return this.subscriptionsNeedRefresh;
+  }
+
+  markMarketDataResubscribed(): void {
+    if (this.connected && !this.brokerBackendLost) this.subscriptionsNeedRefresh = false;
   }
 
   getAccountId(): string {
