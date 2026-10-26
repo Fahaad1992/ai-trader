@@ -54,7 +54,8 @@ describe("SPX broker-backed stop recovery after a crash", () => {
   });
   it("refuses expired, cancelled, wrong contract, wrong qty and wrong parent", () => {
     for (const updates of [
-      { status: "Cancelled" }, { conId: 999999 },
+      { status: "Cancelled" }, { status: "PendingSubmit" },
+      { status: "ApiPending" }, { status: "Filled" }, { conId: 999999 },
       { totalQuantity: 2 }, { parentId: 999 },
       { orderType: "LMT" }, { action: "BUY" }, { permId: 9999 },
     ]) {
