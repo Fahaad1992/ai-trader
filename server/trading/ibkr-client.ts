@@ -549,9 +549,10 @@ class IBKRClient {
           if (this.ib !== client) return;
           const pending = this.pendingRequests.get(reqId);
           if (pending && tickType === 13) {
-            clearTimeout(pending.timeout);
+            // Greeks can arrive BEFORE both bid/ask or volume. Do not clear
+            // the request's timeout until its quote accumulator completes.
+            // Otherwise the 50ms poll remains alive forever on missing ticks.
             pending.resolve({ iv: impliedVol, delta, gamma, vega, theta, optPrice, pvDividend });
-            this.pendingRequests.delete(reqId);
           }
         });
 
