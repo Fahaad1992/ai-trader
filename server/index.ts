@@ -318,7 +318,8 @@ app.get("/api/ibkr/spy-chain", async (_req, res) => {
 
 app.post("/api/webhook/tradingview", async (req, res) => {
   const body = (req.body && typeof req.body === "object") ? req.body as Record<string, unknown> : {};
-  const payloadJson = toSafeJson(body);
+  // Webhook body includes a secret. Never persist it in SQLite error logs.
+  const payloadJson = toSafeJson({ ...body, secret: "[REDACTED]" });
   const providedSecret = asTrimmedString(body.secret);
 
   if (!TV_WEBHOOK_SECRET) {
