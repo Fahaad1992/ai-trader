@@ -807,7 +807,12 @@ export class MarketDataProvider {
         continue;
       }
       const snap = r.value;
-      if (!(snap.bid > 0) || !(snap.ask > 0)) continue;
+      // The returned contract must be the requested contract, not the
+      // nearest strike silently substituted by an underlying chain lookup.
+      if (snap.strike !== snap._strike || snap.expiry !== snap._expiry) continue;
+      if (snap.delayed !== false || !Number.isFinite(snap.timestamp) ||
+          snap.timestamp > Date.now() || Date.now() - snap.timestamp > 2_000) continue;
+      if (!(snap.bid > 0) || !(snap.ask > 0) || snap.ask < snap.bid) continue;
 
       const premium = snap.ask;
       if (premium < premiumRange[0] || premium > premiumRange[1]) continue;
@@ -836,7 +841,7 @@ export class MarketDataProvider {
         moneyness: Math.abs(snap._strike - spxPrice) < strikeInterval ? "ATM" : (type === "call" ? (snap._strike < spxPrice ? "ITM" : "OTM") : (snap._strike > spxPrice ? "ITM" : "OTM")),
         source: "ibkr" as const,
         timestamp: snap.timestamp || 0,
-        delayed: false,
+        delayed: snap.delayed !== false,
       });
     }
 
