@@ -1,3 +1,4 @@
+import { SPX_INITIAL_STOP_RETAINED_FRACTION } from "../../shared/spx-premium-risk.js";
 /**
  * Autonomous SPX option entry PRE-FLIGHT. Pure function, no IBKR network/IO.
  * Emits a paper candidate only. NEVER routes an order or changes bot state.
@@ -107,8 +108,7 @@ export function previewAutonomousSPXEntry(input: {
       limits.maxSpreadFractionOfAsk <= 0 || limits.maxSpreadFractionOfAsk > 0.5 ||
       limits.maxOpenPositions !== 1 || limits.maxDayTrades <= 0 ||
       limits.maxDailyLossUsd <= 0 || limits.maxPremiumOutlayUsd <= 0 ||
-      limits.maxInitialLossUsd <= 0 || limits.initialStopFraction <= 0 ||
-      limits.initialStopFraction >= 1)
+      limits.maxInitialLossUsd <= 0 || limits.initialStopFraction !== SPX_INITIAL_STOP_RETAINED_FRACTION)
     reasons.push("RISK_LIMITS_NOT_APPROVED");
   if (invalid(account.availableFundsUsd) || invalid(account.buyingPowerUsd) ||
       invalid(account.netLiquidationUsd) || account.availableFundsUsd <= 0 ||
