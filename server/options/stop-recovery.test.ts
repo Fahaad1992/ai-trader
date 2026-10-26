@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  reconcileSPXStop, previewRecoveredSPXStopRaise, commitConfirmedRecoveredSPXStop,
+  reconcileSPXStop, previewRecoveredSPXStopRaise, commitConfirmedRecoveredSPXStop, createVerifiedSPXStopRecord,
   type SavedSPXStop, type RecoveryBrokerSnapshot,
 } from "./stop-recovery.js";
 
@@ -95,6 +95,22 @@ describe("SPX broker-backed stop recovery after a crash", () => {
     }, NOW + 1);
     expect(result.proposedStop).toBe(3.5);
     expect(result.nextState.confirmedStop).toBe(3.2);
+  });
+  it("journals an initial stop only when the broker confirms it", () => {
+    const b = broker();
+    const args = {
+      accountId: "DU123", conId: 789123, entryPremium: 3,
+      quantity: 1, entryOrderId: 10, stopOrderId: 11,
+      right: "CALL" as const, expiry: "20261026", strike: 6000,
+      tickSize: 0.01, broker: b, nowMs: NOW,
+    };
+    expect(createVerifiedSPXStopRecord(args).lastConfirmedStop).toBe(3.2);
+    const missing = broker(); missing.orders = [];
+    expect(() => createVerifiedSPXStopRecord({ ...args, broker: missing })).toThrow();
+    const wrong = broker(); wrong.positions = [];
+    expect(() => createVerifiedSPXStopRecord({ ...args, broker: wrong })).toThrow();
+    const noPerm = broker(); noPerm.orders = [{ ...noPerm.orders[0], permId: 0 }];
+    expect(() => createVerifiedSPXStopRecord({ ...args, broker: noPerm })).toThrow();
   });
   it("does not pretend the proposed stop is broker-confirmed", () => {
     const r = reconcileSPXStop(saved(), broker(), "DU123", NOW);
