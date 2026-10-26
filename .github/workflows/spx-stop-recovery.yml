@@ -1,0 +1,32 @@
+name: SPX stop recovery verification
+on:
+  push:
+    branches:
+      - chatgpt/spx-stop-recovery-ledger-20261026
+    paths:
+      - server/options/stop-recovery.ts
+      - server/options/stop-recovery.test.ts
+      - server/trading/engine.ts
+      - server/trading/ibkr-client.ts
+      - server/trading/database.ts
+      - server/trading/broker-exposure-guard.ts
+      - .github/workflows/spx-stop-recovery.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Recovery and stop-ladder tests
+        run: npx vitest run server/options/stop-recovery.test.ts server/options/premium-stop-ladder.test.ts server/trading/broker-exposure-guard.test.ts
+      - name: Production build only (do not start Gateway)
+        run: npm run build

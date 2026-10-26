@@ -14,12 +14,23 @@ export interface BrokerExposureSnapshot {
     conId: number;
     symbol: string;
     quantity: number;
+    secType?: string;
+    right?: string;
+    expiry?: string;
+    strike?: number;
   }>;
   openOrders: ReadonlyArray<{
     orderId: number;
     conId: number;
     symbol: string;
     status: string;
+    permId?: number | null;
+    secType?: string;
+    action?: string;
+    orderType?: string;
+    auxPrice?: number | null;
+    parentId?: number | null;
+    totalQuantity?: number;
   }>;
 }
 export interface BrokerBuyingPowerSnapshot {

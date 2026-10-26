@@ -2,6 +2,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import type { SavedSPXStop } from "../options/stop-recovery.js";
 
 // Ensure data directory exists
 const dataDir = path.join(process.cwd(), 'data');
@@ -506,4 +507,66 @@ export function finalizeTradingViewWebhookEvent(update: {
     last_error: update.last_error ?? null,
   });
 }
+// Separate SPX recovery journal. Schema is additive; existing trades stay intact.
+// A journal row is written only after verified broker-side protective stop ACK.
+db.exec(`
+CREATE TABLE IF NOT EXISTS spx_stop_recovery (
+  account_id TEXT NOT NULL PRIMARY KEY,
+  con_id INTEGER NOT NULL,
+  stop_order_id INTEGER NOT NULL,
+  last_confirmed_stop REAL NOT NULL,
+  record_json TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL
+);
+`);
+
+const upsertSPXStop = db.prepare(`
+INSERT INTO spx_stop_recovery
+(account_id, con_id, stop_order_id, last_confirmed_stop, record_json, recorded_at_ms)
+VALUES (@account_id, @con_id, @stop_order_id, @last_confirmed_stop, @record_json, @recorded_at_ms)
+ON CONFLICT(account_id) DO UPDATE SET
+  con_id = excluded.con_id,
+  stop_order_id = excluded.stop_order_id,
+  last_confirmed_stop = excluded.last_confirmed_stop,
+  record_json = excluded.record_json,
+  recorded_at_ms = excluded.recorded_at_ms
+`);
+
+export function loadSavedSPXStop(accountId: string): SavedSPXStop | null {
+  if (!accountId) return null;
+  const row = db.prepare("SELECT record_json FROM spx_stop_recovery WHERE account_id = ?")
+    .get(accountId) as { record_json: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.record_json) as SavedSPXStop;
+  } catch {
+    // A broken journal must block automatic resumption; never fabricate state.
+    throw new Error("SPX_STOP_RECOVERY_JOURNAL_CORRUPT");
+  }
+}
+
+export function saveVerifiedSPXStop(record: SavedSPXStop): void {
+  if (!record.accountId || !Number.isSafeInteger(record.conId) || record.conId <= 0 ||
+      !Number.isSafeInteger(record.stopOrderId) || record.stopOrderId <= 0 ||
+      !Number.isFinite(record.lastConfirmedStop) || record.lastConfirmedStop <= 0 ||
+      !Number.isFinite(record.recordedAtMs)) {
+    throw new Error("SPX_STOP_RECOVERY_SAVE_REFUSED_INVALID_ACK");
+  }
+  upsertSPXStop.run({
+    account_id: record.accountId,
+    con_id: record.conId,
+    stop_order_id: record.stopOrderId,
+    last_confirmed_stop: record.lastConfirmedStop,
+    record_json: JSON.stringify(record),
+    recorded_at_ms: record.recordedAtMs,
+  });
+}
+
+// Do not erase a journal row on socket disconnect. Remove it only after
+// independent proof that IBKR shows neither the position nor its orders.
+export function clearBrokerVerifiedFlatSPXStop(accountId: string): void {
+  if (!accountId) throw new Error("SPX_ACCOUNT_REQUIRED");
+  db.prepare("DELETE FROM spx_stop_recovery WHERE account_id = ?").run(accountId);
+}
+
 export default db;
