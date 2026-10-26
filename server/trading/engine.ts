@@ -11,6 +11,7 @@ import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat, notifySPXEntry, notifySPXStopUpdate, notifySPXClose } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
 import { roundSPXStop, roundSPXEntry } from "./spx-tick.js";
+import { SPX_INITIAL_STOP_LOSS_FRACTION, getSPXInitialPremiumStopRaw } from "../../shared/spx-premium-risk.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
 import { isProtectionReady, classifySilentFailure } from "./live-safety";
 import {
@@ -303,7 +304,7 @@ const INDEX_STOP_UNDERLYINGS = new Set(["SPX", "NDX", "QQQ"]);
 const SINGLE_STOCK_STOP_UNDERLYINGS = new Set(["NVDA", "TSLA", "AMZN"]);
 
 // ========== SPX OPTIONS DRY_RUN PARAMETERS (all owner-approved) ==========
-const SPX_INITIAL_STOP_PERCENT = 0.40;
+// Initial SPX premium risk is shared with the isolated paper-options module.
 const SPX_MAX_CONTRACTS = 1;
 const SPX_MAX_PREMIUM = 5.00;
 const SPX_UNDERLYING = "SPX";
@@ -367,7 +368,7 @@ function getAssetStopProfile(underlying: string): AssetStopProfile {
 }
 
 function getSPXPremiumStop(entryPremium: number): number {
-  return roundSPXStop(entryPremium * (1 - SPX_INITIAL_STOP_PERCENT));
+  return roundSPXStop(getSPXInitialPremiumStopRaw(entryPremium));
 }
 
 function getSPXTrailingConfig(entryPremium: number): TrailingConfig {
@@ -2015,7 +2016,7 @@ export class TradingEngine {
     const beTrigger = roundSPXStop(fillPrice * (1 + SPX_BE_TRIGGER_PERCENT));
     const beLock = roundSPXStop(fillPrice * (1 + SPX_BE_LOCK_PERCENT));
 
-    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_PERCENT * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE * 100).toFixed(0)}% | contracts:${orderQuantity}`, {
+    this.log("trade", `[SPX_DRY_RUN_ENTRY] ${ct.toUpperCase()} ${underlying} | premium:$${fillPrice.toFixed(2)} | stop:$${stopPremium.toFixed(2)} (-${(SPX_INITIAL_STOP_LOSS_FRACTION * 100).toFixed(0)}%) | BE trigger:$${beTrigger.toFixed(2)} lock:$${beLock.toFixed(2)} | trailing activate:+${(SPX_TRAILING_ACTIVATE_PERCENT * 100).toFixed(0)}% distance:${(SPX_TRAILING_DISTANCE * 100).toFixed(0)}% | contracts:${orderQuantity}`, {
       symbol: underlying, underlying, optionSide: ct.toUpperCase(),
     });
 
