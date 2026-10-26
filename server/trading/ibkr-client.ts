@@ -4,6 +4,7 @@
  */
 import IB from "ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
+import { verifySPXOptionTick } from "./spx-option-tick-quality.js";
 import type { BrokerExposureSnapshot } from "./broker-exposure-guard.js";
 import { checkBrokerEntrySafety } from "./broker-exposure-guard.js";
 
@@ -158,6 +159,8 @@ export interface IBKRStockData {
   close: number;
   volume: number;
   timestamp: number;
+  bidReceivedAtMs?: number;
+  askReceivedAtMs?: number;
 }
 
 export interface IBKROptionData {
@@ -178,6 +181,7 @@ export interface IBKROptionData {
   vega: number;
   iv: number;
   timestamp: number;
+  delayed?: boolean;
 }
 
 export interface IBKROrderResult {
@@ -471,10 +475,12 @@ class IBKRClient {
             case 1:
             case 66:
               existing.bid = price;
+              existing.bidReceivedAtMs = Date.now();
               break;
             case 2:
             case 67:
               existing.ask = price;
+              existing.askReceivedAtMs = Date.now();
               break;
             case 4:
             case 68:
@@ -852,56 +858,59 @@ class IBKRClient {
       tradingClass: contractRow.tradingClass || underlying,
     };
 
-    return new Promise((resolve) => {
+    return new Promise<IBKROptionData | null>((resolve) => {
       let greeks: any = null;
-      const finish = () => {
-        clearTimeout(timeout);
+      let finished = false;
+      let poll: ReturnType<typeof setInterval> | null = null;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const finish = (snapshot: IBKROptionData | null) => {
+        if (finished) return;
+        finished = true;
+        if (timeout) clearTimeout(timeout);
+        if (poll) clearInterval(poll);
         this.pendingRequests.delete(reqId);
-        try { this.ib!.cancelMktData(reqId); } catch {}
-        const priceData = this.stockPrices.get(`OPT_${reqId}`) || { bid: 0, ask: 0, last: 0, volume: 0 };
-        const hasPrice = (priceData.bid || 0) > 0 || (priceData.ask || 0) > 0 || (priceData.last || 0) > 0;
-        if (!hasPrice && !greeks) {
-          resolve(null);
-          return;
-        }
-        resolve({
+        this.tickerReqMap.delete(reqId);
+        this.tickerFeedModes.delete(`OPT_${reqId}`);
+        this.stockPrices.delete(`OPT_${reqId}`);
+        try { this.ib?.cancelMktData(reqId); } catch {}
+        resolve(snapshot);
+      };
+      const maybeResolve = () => {
+        const priceData = this.stockPrices.get(`OPT_${reqId}`);
+        if (!priceData || !greeks || !Number.isFinite(greeks.delta) || greeks.delta === 0) return;
+        const verdict = verifySPXOptionTick({
+          bid: priceData.bid, ask: priceData.ask,
+          bidReceivedAtMs: priceData.bidReceivedAtMs,
+          askReceivedAtMs: priceData.askReceivedAtMs,
+          marketDataMode: this.tickerFeedModes.get(`OPT_${reqId}`) || "unknown",
+        }, Date.now());
+        if (!verdict.ok) return;
+        finish({
           ticker: `${underlying}${normalizedExpiry}${type === "call" ? "C" : "P"}${resolvedStrike}`,
-          underlying,
-          type,
-          strike: resolvedStrike,
-          expiry: normalizedExpiry,
-          bid: priceData.bid || 0,
-          ask: priceData.ask || 0,
-          mid: priceData.bid && priceData.ask ? (priceData.bid + priceData.ask) / 2 : 0,
-          last: priceData.last || 0,
-          volume: priceData.volume || 0,
-          openInterest: 0,
-          delta: greeks?.delta || 0,
-          gamma: greeks?.gamma || 0,
-          theta: greeks?.theta || 0,
-          vega: greeks?.vega || 0,
-          iv: greeks?.iv || 0,
-          timestamp: Date.now(),
+          underlying, type, strike: resolvedStrike, expiry: normalizedExpiry,
+          bid: verdict.bid, ask: verdict.ask,
+          mid: (verdict.bid + verdict.ask) / 2,
+          last: priceData.last || 0, volume: priceData.volume || 0,
+          openInterest: 0, delta: greeks.delta,
+          gamma: greeks.gamma || 0, theta: greeks.theta || 0,
+          vega: greeks.vega || 0, iv: greeks.iv || 0,
+          timestamp: verdict.timestampMs, delayed: false,
         });
       };
-
-      const timeout = setTimeout(() => finish(), 12000);
-
+      // Enforce a bounded quote interval. No fabricated timestamp at timeout.
+      timeout = setTimeout(() => finish(null), 2500);
+      poll = setInterval(maybeResolve, 50);
       this.pendingRequests.set(reqId, {
-        resolve: (data: any) => {
-          greeks = data || greeks;
-        },
-        reject: () => {
-          clearTimeout(timeout);
-          this.pendingRequests.delete(reqId);
-          try { this.ib!.cancelMktData(reqId); } catch {}
-          resolve(null);
-        },
+        resolve: (data: any) => { greeks = data || greeks; maybeResolve(); },
+        reject: () => finish(null),
         timeout,
       });
-
       this.tickerReqMap.set(reqId, `OPT_${reqId}`);
-      this.ib!.reqMktData(reqId, contract, "100,101,104,106", false, false);
+      try {
+        this.ib!.reqMktData(reqId, contract, "100,101,104,106", false, false);
+      } catch {
+        finish(null);
+      }
     });
   }
 
