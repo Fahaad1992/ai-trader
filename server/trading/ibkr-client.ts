@@ -1604,6 +1604,10 @@ class IBKRClient {
         if (qty !== 0) positions.push({
           account: accountId, conId: Number(contract.conId),
           symbol: String(contract.symbol || "?"), quantity: qty,
+          secType: String(contract.secType || ""),
+          right: String(contract.right || ""),
+          expiry: String(contract.lastTradeDateOrContractMonth || ""),
+          strike: Number(contract.strike || 0),
         });
       };
       const onPositionEnd = () => {
@@ -1619,6 +1623,13 @@ class IBKRClient {
         openOrders.push({
           orderId: Number(id), conId: Number(contract?.conId || 0),
           symbol: String(contract?.symbol || "?"), status,
+          secType: String(contract?.secType || ""),
+          permId: Number(order?.permId || 0),
+          action: String(order?.action || ""),
+          orderType: String(order?.orderType || ""),
+          auxPrice: Number(order?.auxPrice ?? NaN),
+          parentId: Number(order?.parentId ?? NaN),
+          totalQuantity: Number(order?.totalQuantity ?? NaN),
         });
       };
       const onOpenOrderEnd = () => {
