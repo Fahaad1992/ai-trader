@@ -76,7 +76,7 @@ describe("autonomous SPX candidate preflight (never executes)", () => {
   it("blocks delayed quotes even if apparent signal is strong", () => {
     const inp = makeInput();
     const delayed = { ...inp, quote: { ...inp.quote, marketDataType: "DELAYED" as const } };
-    const d = previewAutonomousSPXEntry(inp);
+    const d = previewAutonomousSPXEntry(delayed);
     expect(d.reasons).toContain("OPTION_QUOTE_NOT_FRESH_LIVE");
   });
   it("blocks stale quote and stale signal", () => {
