@@ -1032,40 +1032,9 @@ export class TradingEngine {
         return;
       }
       if (this.dataState !== "connected") {
-        this.dataRetryCount++;
-        this.log("info", `إعادة محاولة تحميل البيانات (محاولة ${this.dataRetryCount})...`);
-        const loaded = await market.loadPrices();
-        if (loaded) {
-          this.dataState = "connected";
-          this.waitingModeAlerted = false;
-          this.dataLoadFailureAlerted = false;
-          this.dataSourceFailureAlerted = false;
-          this.healthFailureAlerted = false;
-          if (market.isIBKRConnected() && this.ibkrDisconnectAlerted) {
-            try { notifyIBKRReconnect(); } catch {}
-            this.ibkrDisconnectAlerted = false;
-          }
-          this.log("info", `تم الاتصال بالبيانات بنجاح! SPY=$${market.getPrice("SPY")} | QQQ=$${market.getPrice("QQQ")}`);
-        } else {
-          this.dataState = "waiting";
-          this.log("warn", "لا زالت البيانات غير متاحة - البوت شغال وينتظر...");
-          if (!this.dataLoadFailureAlerted) {
-            try { notifyDataLoadFailure("تعذر تحميل بيانات السوق"); } catch {}
-            this.dataLoadFailureAlerted = true;
-          }
-          if (!this.waitingModeAlerted) {
-            try { notifyWaitingMode("النظام بانتظار عودة البيانات"); } catch {}
-            this.waitingModeAlerted = true;
-          }
-          if (this.dataRetryCount >= 3 && !this.dataSourceFailureAlerted) {
-            try { notifyDataSourceFailure("بيانات السوق", "تعذر استعادة البيانات بعد عدة محاولات"); } catch {}
-            this.dataSourceFailureAlerted = true;
-          }
-          if (this.dataRetryCount >= 3 && !this.healthFailureAlerted) {
-            try { notifyHealthFailure("مصدر البيانات غير متاح بعد عدة محاولات"); } catch {}
-            this.healthFailureAlerted = true;
-          }
-        }
+        // Never let a timed price refresh silently promote a reconnected
+        // socket to trade-ready without verifying account and exposure.
+        void this.superviseBrokerConnection();
         return;
       }
       await market.refreshPrices();
