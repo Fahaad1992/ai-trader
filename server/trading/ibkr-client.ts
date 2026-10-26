@@ -2,7 +2,7 @@
  * IBKR Client - Connects to IB Gateway via TWS API
  * Uses @stoqey/ib library for real-time market data and order execution
  */
-import IB from "ib";
+import { IBApi as StoqeyIBApi } from "@stoqey/ib";
 import { assertOptionsRuntimeAllowed, isFuturesMode, isSPXOptionsMode } from "./trade-mode.js";
 import { verifySPXOptionTick } from "./spx-option-tick-quality.js";
 import { checkLongSPXOrderScope } from "./spx-execution-scope.js";
@@ -112,7 +112,7 @@ function removeListenerSafe(target: any, event: string, listener: (...args: any[
 }
 
 function createIbClient(options: { host: string; port: number; clientId: number }): IBApi {
-  return new (IB as any)(options);
+  return new StoqeyIBApi(options);
 }
 
 const IBKR_HOST = process.env.IBKR_HOST || "127.0.0.1";
@@ -159,6 +159,7 @@ export interface IBKRStockData {
   low: number;
   close: number;
   volume: number;
+  openInterest?: number;
   timestamp: number;
   bidReceivedAtMs?: number;
   askReceivedAtMs?: number;
@@ -238,6 +239,10 @@ class IBKRClient {
   // Data storage
   private stockPrices = new Map<string, IBKRStockData>();
   private optionData = new Map<string, IBKROptionData[]>();
+  // Requesting identical SPX option chains for every candidate caused dozens
+  // of duplicate IB API calls. Short cache + single in-flight query.
+  private spxChainCache = new Map<string, {data: any[];expiresMs: number}>();
+  private spxChainPending = new Map<string, Promise<any[]>>();
   private orderResults = new Map<number, IBKROrderResult>();
   private tickerReqMap = new Map<number, string>();
   private underlyingConIds = new Map<string, number>();
@@ -277,6 +282,8 @@ class IBKRClient {
       } catch {}
     }
     this.pendingRequests.clear();
+    this.spxChainCache.clear();
+    this.spxChainPending.clear();
 
     this.ib = null;
     this.connected = false;
@@ -349,10 +356,14 @@ class IBKRClient {
           finalize(false);
         });
 
-        client.on(EventName.error, (err: Error, data?: { id?: number; code?: number }) => {
+        client.on(EventName.error, (err: Error, codeOrData?: number | { id?: number; code?: number }, idArg?: number) => {
           if (this.ib !== client) return;
-          const code = Number(data?.code ?? -1);
-          const reqId = Number(data?.id ?? -1);
+          // @stoqey/ib emits (Error, errorCode, requestId). Legacy clients
+          // may emit (Error, {code,id}); support both without swallowing 1100.
+          const code = typeof codeOrData === "number"
+            ? codeOrData : Number(codeOrData?.code ?? -1);
+          const reqId = typeof codeOrData === "number"
+            ? Number(idArg ?? -1) : Number(codeOrData?.id ?? -1);
           const errorMessage = err?.message || String(err);
           const msg = `[IBKR] Error: ${errorMessage} (code: ${code}, reqId: ${reqId})`;
           if (code === 1100 || code === 2110 || code === 1300) {
@@ -518,9 +529,17 @@ class IBKRClient {
           const existing = this.stockPrices.get(ticker);
           if (!existing) return;
 
-          if (tickType === 8) {
+          // IBKR option generic tick 100: call/put volume (29/30).
+          // Generic 101: call/put open interest (27/28).
+          // Standard tick 8 carries volume for some feeds; do not assume all
+          // option contracts report their trading volume through type 8.
+          const optionTicker = ticker.startsWith("OPT_");
+          if (tickType === 8 || (optionTicker && (tickType === 29 || tickType === 30))) {
             existing.volume = size;
             existing.timestamp = Date.now();
+            this.stockPrices.set(ticker, existing);
+          } else if (optionTicker && (tickType === 27 || tickType === 28)) {
+            existing.openInterest = size;
             this.stockPrices.set(ticker, existing);
           }
         });
@@ -808,12 +827,36 @@ class IBKRClient {
     });
   }
 
+  private async getCachedSPXChain(
+    underlying: string, type: "call" | "put", normalizedExpiry: string,
+  ): Promise<any[]> {
+    if (underlying !== "SPX") return this.getOptionChain(underlying, type, 0, 0, normalizedExpiry);
+    const key = `${underlying}:${normalizedExpiry}`;
+    const cached = this.spxChainCache.get(key);
+    if (cached && cached.expiresMs > Date.now() && this.isConnected()) return cached.data;
+    const already = this.spxChainPending.get(key);
+    if (already) return already;
+    const pending = (async (): Promise<any[]> => {
+      try {
+        const data = await this.getOptionChain(underlying, type, 0, 0, normalizedExpiry);
+        const rows = Array.isArray(data) ? data as any[] : [];
+        if (rows.length > 0 && this.isConnected())
+          this.spxChainCache.set(key, { data: rows, expiresMs: Date.now() + 30_000 });
+        return rows;
+      } catch { return []; }
+    })();
+    this.spxChainPending.set(key,pending);
+    try { return await pending; } finally {
+      if (this.spxChainPending.get(key) === pending) this.spxChainPending.delete(key);
+    }
+  }
+
   async getOptionSnapshot(underlying: string, type: "call" | "put", strike: number, expiry: string): Promise<IBKROptionData | null> {
     if (!this.connected || !this.ib) return null;
 
     const reqId = this.getNextReqId();
     const normalizedExpiry = expiry.replace(/-/g, "");
-    const chainRows = await this.getOptionChain(underlying, type, 0, 0, normalizedExpiry);
+    const chainRows = await this.getCachedSPXChain(underlying, type, normalizedExpiry);
     const validRows = (chainRows as any[]).filter((row: any) =>
       Array.isArray(row?.expirations) && row.expirations.includes(normalizedExpiry) &&
       Array.isArray(row?.strikes) && row.strikes.some((value: number) => typeof value === "number" && value > 0)
@@ -838,6 +881,10 @@ class IBKRClient {
 
     let resolvedStrike = strike > 0 ? strike : 0;
     const strikeExists = resolvedStrike > 0 && availableStrikes.some((value: number) => Math.abs(value - resolvedStrike) < 0.0001);
+    if (resolvedStrike > 0 && !strikeExists) {
+      // Never silently return a different contract to the caller.
+      return null;
+    }
     if (!strikeExists) {
       const anchorPrice = underlyingPrice > 0 ? underlyingPrice : (resolvedStrike > 0 ? resolvedStrike : 0);
       if (!(anchorPrice > 0)) return null;
@@ -878,7 +925,11 @@ class IBKRClient {
       };
       const maybeResolve = () => {
         const priceData = this.stockPrices.get(`OPT_${reqId}`);
-        if (!priceData || !greeks || !Number.isFinite(greeks.delta) || greeks.delta === 0) return;
+        // Do not return immediately on Greeks + quote if the IBKR option
+        // trading-volume tick hasn't arrived yet; a fake zero-volume snapshot
+        // would make every otherwise-valid contract fail the liquidity guard.
+        if (!priceData || !greeks || !Number.isFinite(greeks.delta) || greeks.delta === 0 ||
+            !Number.isFinite(priceData.volume) || priceData.volume <= 0) return;
         const verdict = verifySPXOptionTick({
           bid: priceData.bid, ask: priceData.ask,
           bidReceivedAtMs: priceData.bidReceivedAtMs,
@@ -892,7 +943,7 @@ class IBKRClient {
           bid: verdict.bid, ask: verdict.ask,
           mid: (verdict.bid + verdict.ask) / 2,
           last: priceData.last || 0, volume: priceData.volume || 0,
-          openInterest: 0, delta: greeks.delta,
+          openInterest: priceData.openInterest || 0, delta: greeks.delta,
           gamma: greeks.gamma || 0, theta: greeks.theta || 0,
           vega: greeks.vega || 0, iv: greeks.iv || 0,
           timestamp: verdict.timestampMs, delayed: false,

@@ -13,6 +13,7 @@ import { newsFilter, type NewsFilterStatus } from "./news-filter.js";
 import { notifyBotStart, notifyTradeEntry, notifyTradeExit, notifyTradeRejected, notifyError, notifyIBKRDisconnect, notifyIBKRReconnect, notifyStopLossHit, notifyNewsAlert, notifyDailyReport, notifyDecision, notifyDataLoadFailure, notifyWaitingMode, notifyBotStopped, notifyDataSourceFailure, notifyCriticalError, notifyHealthFailure, notifyHeartbeat, notifySPXEntry, notifySPXStopUpdate, notifySPXClose } from "./notify.js";
 import { getTradeMode, getOptionsRuntimeGuardMessage, isFuturesMode, isSPXOptionsMode, sanitizeConfigForMode, sanitizeLogForMode, sanitizeTradeForMode } from "./trade-mode.js";
 import { roundSPXStop, roundSPXEntry } from "./spx-tick.js";
+import { SPX_OPTION_SELECTION, deriveSPXBudget, assessSPXCandidate } from "./spx-contract-selection.js";
 import { resolveLongSPXOptionFromTrend } from "./spx-execution-scope.js";
 import { SPX_INITIAL_STOP_LOSS_FRACTION, getSPXInitialPremiumStopRaw } from "../../shared/spx-premium-risk.js";
 import { readTastytradeAccountSnapshot, type TastytradeAccountSnapshot } from "./tastytrade-account.js";
@@ -309,11 +310,11 @@ const SINGLE_STOCK_STOP_UNDERLYINGS = new Set(["NVDA", "TSLA", "AMZN"]);
 // ========== SPX OPTIONS DRY_RUN PARAMETERS (all owner-approved) ==========
 // Initial SPX premium risk is shared with the isolated paper-options module.
 const SPX_MAX_CONTRACTS = 1;
-const SPX_MAX_PREMIUM = 5.00;
+const SPX_MAX_PREMIUM = SPX_OPTION_SELECTION.absoluteMaxPremium;
 const SPX_UNDERLYING = "SPX";
-const SPX_MAX_SPREAD = 0.30;
-const SPX_DELTA_MIN = 0.40;
-const SPX_DELTA_MAX = 0.60;
+const SPX_MAX_SPREAD = SPX_OPTION_SELECTION.maximumSpreadUsd;
+const SPX_DELTA_MIN = SPX_OPTION_SELECTION.minimumAbsDelta;
+const SPX_DELTA_MAX = SPX_OPTION_SELECTION.maximumAbsDelta;
 const SPX_QUOTE_MAX_AGE_MS = 2_000;
 // Stop upgrade (example entry $5.00):
 //   above $5.30 (+6%) → stop ~$5.20 (entry + 4%)
@@ -2080,12 +2081,23 @@ export class TradingEngine {
       return this.rejectOptionQuality(underlying, ct, null, "SPX_IBKR_DISCONNECTED: IBKR not connected — SPX requires IBKR data", "spx_ibkr_disconnected");
     }
 
+    // A simulated SPX order must still fit the ACTUAL IBKR portfolio, not
+    // a stale $1000 paper-budget configured in the engine.
+    const summary = await ibkr.getAccountSummary();
+    const now = Date.now();
+    const budget = deriveSPXBudget(summary, now);
+    if (!budget.ok) {
+      this.log("warn", `[SPX_BROKER_BUDGET_BLOCK] ${budget.reason}`);
+      return null;
+    }
+    this.log("info", `[SPX_BROKER_RISK_BUDGET] cash=${summary?.availableFunds} NLV=${summary?.netLiquidation} maxPremium=${budget.maximumPremium} maxIntendedStopRisk=${budget.maximumIntendedStopRiskUsd}`);
     let opt: OptionQuote | null = null;
     try {
       opt = await market.findSPXOptionIBKR(
         ct,
         [SPX_DELTA_MIN, SPX_DELTA_MAX],
-        [0.10, SPX_MAX_PREMIUM],
+        [SPX_OPTION_SELECTION.minimumPremium, Math.min(SPX_MAX_PREMIUM, budget.maximumPremium)],
+        budget,
       );
     } catch (e: any) {
       return this.rejectOptionQuality(underlying, ct, null, `SPX IBKR option lookup failed — ${e.message}`, "spx_ibkr_lookup_failed");
@@ -2103,6 +2115,18 @@ export class TradingEngine {
       return this.rejectOptionQuality(underlying, ct, opt, "SPX_PREMIUM_MISSING: bid/ask unavailable", "spx_premium_missing");
     }
 
+    // Requalify at decision time; both funding snapshot and option ticks
+    // can age out while IBKR scans alternative strikes.
+    const finalBudget = deriveSPXBudget(summary,Date.now());
+    if (!finalBudget.ok) {
+      return this.rejectOptionQuality(underlying,ct,opt,
+        `SPX_BROKER_BUDGET_EXPIRED: ${finalBudget.reason}`,"spx_broker_budget_stale");
+    }
+    const finalAssessment = assessSPXCandidate(opt, finalBudget, Date.now());
+    if (!finalAssessment.qualified) {
+      return this.rejectOptionQuality(underlying,ct,opt,
+        `SPX_FINAL_RISK_REJECT: ${finalAssessment.reasons.join(",")}`,"spx_final_risk_block");
+    }
     const premium = opt.ask;
     if (premium > SPX_MAX_PREMIUM) {
       return this.rejectOptionQuality(underlying, ct, opt, `SPX_PREMIUM_ABOVE_OWNER_LIMIT: $${premium.toFixed(2)} > $${SPX_MAX_PREMIUM}`, "spx_premium_above_owner_limit");
