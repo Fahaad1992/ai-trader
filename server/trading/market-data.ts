@@ -455,7 +455,10 @@ export class MarketDataProvider {
         }
       }
       await delay(3000);
-      return true;
+      // IBKR 1101: after backend reset, ticker subscriptions have to be
+      // re-issued before entry scanning may resume.
+      ibkr.markMarketDataResubscribed();
+      return ibkr.isConnected();
     }
     this.ibkrMode = false;
     console.warn("[Market] IBKR connection failed. Trading path remains fail-safe: no fallback data source, no execution.");
