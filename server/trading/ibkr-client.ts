@@ -1275,7 +1275,7 @@ class IBKRClient {
       transmit: true,
     };
 
-    return new Promise((resolve, reject) => {
+    return await new Promise<IBKROrderResult | null>((resolve) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(parentOrderId);
         const parentResult = this.orderResults.get(parentOrderId);
