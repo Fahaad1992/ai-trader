@@ -8,7 +8,7 @@ import { engine } from "./trading/engine.js";
 import { getMarketStatus, market } from "./trading/market-data.js";
 import { ibkr } from "./trading/ibkr-client.js";
 import { createTradingViewWebhookEvent, finalizeTradingViewWebhookEvent, loadTradingViewWebhookEvent, saveLog } from "./trading/database.js";
-import { isFuturesMode } from "./trading/trade-mode.js";
+import { isFuturesMode, isSPXOptionsMode } from "./trading/trade-mode.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -252,7 +252,13 @@ function evaluateExecutionBridge(input: {
 
 // API routes
 app.get("/api/bot/status", (_req, res) => res.json(engine.getStatus()));
-app.post("/api/bot/start", requireOperatorAuthorization, async (_req, res) => { await engine.start(); res.json({ ok: true }); });
+app.post("/api/bot/start", requireOperatorAuthorization, async (_req, res) => {
+  await engine.start();
+  const running = engine.getStatus().running;
+  res.status(running ? 200 : 409).json({
+    ok: running, running, reason: running ? undefined : "SPX_BOT_START_BLOCKED_NOT_READY",
+  });
+});
 app.post("/api/bot/stop", requireOperatorAuthorization, (_req, res) => { engine.stop(); res.json({ ok: true }); });
 app.get("/api/bot/logs", (req, res) => {
   const limit = Number(req.query.limit) || 50;
@@ -265,7 +271,14 @@ app.get("/api/bot/logs", (req, res) => {
 app.get("/api/bot/last-errors", (req, res) => res.json(engine.getLastErrors(Number(req.query.limit) || 20)));
 app.get("/api/trades/open", (_req, res) => res.json(engine.getOpenTrades()));
 app.get("/api/trades/closed", (_req, res) => res.json(engine.getClosedTrades()));
-app.post("/api/trades/close", requireOperatorAuthorization, async (req, res) => { await engine.closeById(req.body.tradeId, req.body.currentPremium); res.json({ ok: true }); });
+app.post("/api/trades/close", requireOperatorAuthorization, async (req, res) => {
+  if (isSPXOptionsMode()) {
+    res.status(409).json({ ok:false, error:"SPX_LOCAL_CLOSE_DISABLED_USE_VERIFIED_BROKER_POSITION_CLOSE" });
+    return;
+  }
+  await engine.closeById(req.body.tradeId, req.body.currentPremium);
+  res.json({ ok:true });
+});
 app.get("/api/stats/daily", (_req, res) => res.json(engine.getDailyStats()));
 app.get("/api/stats/overall", (_req, res) => res.json(engine.getOverallStats()));
 app.get("/api/stats/history", (_req, res) => res.json(engine.getHistory()));
